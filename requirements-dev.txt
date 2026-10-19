@@ -1,0 +1,4 @@
+# Test and packaging tools (in addition to the runtime requirements).
+-r requirements.txt
+pytest>=8.0
+pyinstaller>=6.10

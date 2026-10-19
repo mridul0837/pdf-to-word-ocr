@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller output
+build/
+dist/
+
+# Optional local copies of model weights / bundled Tesseract (large)
+models/
+tesseract/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
