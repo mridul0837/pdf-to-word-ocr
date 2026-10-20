@@ -79,11 +79,12 @@ def test_window_initial_state(window):
     assert [window.mode.itemText(i) for i in range(window.mode.count())] == list(MODES)
     assert window.mode.currentText() == MODE_AUTO
     assert window.dpi.currentText() == "250"
-    assert window.allow_download.isChecked()
+    # No engine settings in the GUI: Tesseract path, model and download use the defaults.
+    assert window.processing_options() == {"mode": MODE_AUTO, "language": "eng", "dpi": 250, "join_lines": True}
     assert not window.export_btn.isEnabled()
     assert not window.cancel_btn.isEnabled()
     assert window.process_btn.isEnabled()
-    assert "does not detect handwriting" in window.mode_hint.text()
+    assert "does not switch to handwriting" in window.mode_hint.text()
 
 
 def test_handwriting_mode_disables_language(window):
@@ -96,7 +97,7 @@ def test_handwriting_mode_disables_language(window):
 
 def test_extract_without_pdf_shows_message(window):
     assert window.start_processing() is False
-    assert window.dialogs == [("info", "Choose a PDF", "Please choose a PDF file first.")]
+    assert window.dialogs == [("info", "Choose a file", "Please choose a PDF or image file first.")]
 
 
 def test_selecting_pdf_suggests_output_path(window, tmp_path):
@@ -168,23 +169,35 @@ def test_settings_are_persisted(qapp, tmp_path):
     ini = str(tmp_path / "persist.ini")
     first = RecordingWindow(QSettings(ini, QSettings.Format.IniFormat))
     first.mode.setCurrentText(MODE_HANDWRITING)
-    first.tesseract_edit.setText(r"C:\Tools\Tesseract-OCR\tesseract.exe")
-    first.allow_download.setChecked(False)
+    first.language.setCurrentText("fra")
     first.dpi.setCurrentText("300")
+    first.join_lines.setChecked(False)
     first.save_settings()
     first.deleteLater()
 
     second = RecordingWindow(QSettings(ini, QSettings.Format.IniFormat))
-    assert second.mode.currentText() == MODE_HANDWRITING
-    assert second.tesseract_edit.text() == r"C:\Tools\Tesseract-OCR\tesseract.exe"
-    assert not second.allow_download.isChecked()
-    assert second.processing_options()["dpi"] == 300
-    assert second.processing_options()["allow_model_download"] is False
+    assert second.processing_options() == {"mode": MODE_HANDWRITING, "language": "fra", "dpi": 300, "join_lines": False}
     second.deleteLater()
 
 
-def test_missing_tesseract_test_button_reports_problem(window, no_tesseract):
-    window.tesseract_edit.setText("")
-    window.test_tesseract()
-    assert window.dialogs[-1][0] == "warn"
-    assert "Tesseract OCR was not found" in window.dialogs[-1][2]
+def test_missing_tesseract_is_reported_with_how_to_fix(window, qapp, tmp_path, no_tesseract):
+    from conftest import png_bytes, text_image
+
+    scan = tmp_path / "scan.png"
+    scan.write_bytes(png_bytes(text_image("scanned page")))
+    window.set_pdf(str(scan))
+    window.mode.setCurrentText("Printed Text")
+    window.start_processing()
+    wait_until(qapp, lambda: not window.is_busy)
+    kind, title, message = window.dialogs[-1]
+    assert (kind, title) == ("error", "Processing failed")
+    assert "Tesseract OCR was not found" in message and "TESSERACT_CMD" in message
+    assert "Settings" not in message
+
+
+def test_images_are_accepted_by_picker_and_drop():
+    assert desktop_app.is_supported_file(r"C:\scans\letter.PDF")
+    assert desktop_app.is_supported_file(r"C:\scans\photo.jpeg")
+    assert desktop_app.is_supported_file(r"C:\scans\page.tiff")
+    assert not desktop_app.is_supported_file(r"C:\scans\notes.docx")
+    assert "*.png" in desktop_app.FILE_FILTER and "*.pdf" in desktop_app.FILE_FILTER

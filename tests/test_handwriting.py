@@ -71,6 +71,32 @@ def test_trocr_tokenised_punctuation_is_joined():
     assert pipeline.tidy_trocr_text(" meeting on Friday , at 3 . ") == "meeting on Friday, at 3."
     assert pipeline.tidy_trocr_text("Is it ready ?") == "Is it ready?"
     assert pipeline.tidy_trocr_text("$1,284.50 total") == "$1,284.50 total"
+    # Seen on a real handwritten letter:
+    assert pipeline.tidy_trocr_text('an " alien unprivileged enemy belligerent , "') == (
+        'an "alien unprivileged enemy belligerent,"'
+    )
+    assert pipeline.tidy_trocr_text("2 ) Mr. Khan") == "2) Mr. Khan"
+    assert pipeline.tidy_trocr_text("( see note )") == "(see note)"
+    assert pipeline.tidy_trocr_text('he said " hello') == 'he said " hello'  # unpaired quote left alone
+
+
+def test_small_mark_above_a_line_joins_that_line():
+    import cv2
+
+    image = handwriting_image(["first line here", "an alien enemy", "third line"])
+    canvas = np.array(image)
+    # A short opening-quote mark just above the tall letters of line 2 (which start at y~496).
+    cv2.line(canvas, (300, 468), (297, 482), (20, 20, 20), 4)
+    cv2.line(canvas, (316, 468), (313, 482), (20, 20, 20), 4)
+    boxes = segment_lines(Image.fromarray(canvas))
+    assert len(boxes) == 3
+    x, y, w, h = boxes[1]
+    assert y <= 468 and y + h >= 540  # line 2 now includes the mark
+
+
+def test_generation_uses_the_kv_cache(fake_recognizer):
+    fake_recognizer.recognize_page(handwriting_image(["hello"]))
+    assert fake_recognizer.model.generate_options == [{"use_cache": True}]
 
 
 def test_blank_page_never_calls_the_model(fake_recognizer):

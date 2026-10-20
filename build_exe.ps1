@@ -38,6 +38,15 @@ if (-not $Python) {
 }
 Write-Host "Using Python: $Python"
 
+# PyInstaller replaces dist\PDFtoWordOCR; a running copy locks its files and the
+# build would fail half-way through deleting the old folder.
+$distDir = Join-Path $PSScriptRoot "dist\PDFtoWordOCR"
+$running = Get-Process PDFtoWordOCR -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith($distDir, [StringComparison]::OrdinalIgnoreCase) }
+if ($running) {
+    throw "PDF to Word OCR is running from $distDir (PID $($running.Id -join ', ')). Close it and run the build again."
+}
+
 & $Python -c "import PyInstaller, PySide6, pymupdf, docx, pytesseract, cv2, torch, transformers"
 if ($LASTEXITCODE -ne 0) {
     throw "Build dependencies are missing. Run: & '$Python' -m pip install -r requirements-dev.txt"
@@ -54,7 +63,6 @@ $env:PDFOCR_CONSOLE = if ($Console) { "1" } else { "0" }
 & $Python -m PyInstaller --noconfirm --clean PDFtoWordOCR.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE." }
 
-$distDir = Join-Path $PSScriptRoot "dist\PDFtoWordOCR"
 $exe = Join-Path $distDir "PDFtoWordOCR.exe"
 if (-not (Test-Path -LiteralPath $exe)) { throw "PyInstaller finished but $exe was not created." }
 
@@ -75,5 +83,6 @@ if (Test-Path -LiteralPath $report) {
 $sizeGB = (Get-ChildItem -LiteralPath $distDir -Recurse -File | Measure-Object Length -Sum).Sum / 1GB
 Write-Host ("`nBuild output: {0}  ({1:N2} GB folder)" -f $exe, $sizeGB)
 Write-Host "Ship the whole dist\PDFtoWordOCR folder, not just the .exe."
-Write-Host "Tesseract and the TrOCR model weights must be available on the target PC (see README.md)."
+Write-Host "Tesseract and the TrOCR model weights must be available on the target PC (see README.md),"
+Write-Host "or run .\make_portable.ps1 to bundle both and create a ZIP that needs no installation."
 if ($proc.ExitCode -ne 0) { throw "Self-test of the built executable failed (exit code $($proc.ExitCode))." }

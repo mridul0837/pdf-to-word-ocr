@@ -59,6 +59,23 @@ def _check_digital_pdf() -> str:
     return f"{page.method}: {page.text!r}"
 
 
+def _check_image_input() -> str:
+    import io
+
+    from PIL import Image
+
+    from .pipeline import open_pdf
+
+    buf = io.BytesIO()
+    Image.new("RGB", (300, 400), "white").save(buf, format="PNG")
+    doc = open_pdf(buf.getvalue())
+    pages = doc.page_count
+    doc.close()
+    if pages != 1:
+        raise AssertionError(f"expected 1 page, got {pages}")
+    return "PNG image opened as a 1-page document"
+
+
 def _check_docx(tmp: Path) -> str:
     from docx import Document
 
@@ -91,12 +108,13 @@ def _check_tesseract(tmp: Path) -> str:
     import pymupdf
     from PIL import Image, ImageDraw, ImageFont
 
-    from .pipeline import METHOD_TESSERACT, TesseractNotFoundError, process_pdf, tesseract_version
+    from .pipeline import METHOD_TESSERACT, TesseractNotFoundError, find_tesseract, process_pdf, tesseract_version
 
     try:
         version = tesseract_version()
     except TesseractNotFoundError as exc:
         raise _Skip(str(exc).splitlines()[0])
+    cmd = find_tesseract()
     image = Image.new("RGB", (1400, 300), "white")
     try:
         font = ImageFont.truetype("arial.ttf", 64)
@@ -114,7 +132,7 @@ def _check_tesseract(tmp: Path) -> str:
     text = result.pages[0].text
     if result.pages[0].method != METHOD_TESSERACT or "BROWN" not in text.upper():
         raise AssertionError(f"unexpected OCR output: {text!r}")
-    return f"Tesseract {version}: {text!r}"
+    return f"Tesseract {version} ({cmd}): {text!r}"
 
 
 def _check_handwriting() -> str:
@@ -122,9 +140,10 @@ def _check_handwriting() -> str:
     import numpy as np
     from PIL import Image
 
-    from .pipeline import HandwritingModelError, HandwritingRecognizer
+    from .pipeline import HandwritingModelError, HandwritingRecognizer, resolve_model_source
 
     recognizer = HandwritingRecognizer(allow_download=False)
+    source = resolve_model_source(recognizer.model_id)
     try:
         recognizer.load()
     except HandwritingModelError as exc:
@@ -136,7 +155,7 @@ def _check_handwriting() -> str:
     elapsed = time.perf_counter() - start
     if not text.strip():
         raise AssertionError("model returned no text")
-    return f"device {recognizer.device}, {elapsed:.1f}s: {text!r}"
+    return f"model {source}, device {recognizer.device}, {elapsed:.1f}s: {text!r}"
 
 
 def run_self_test(report_path: Optional[str] = None, window_factory: Optional[Callable] = None) -> int:
@@ -146,6 +165,7 @@ def run_self_test(report_path: Optional[str] = None, window_factory: Optional[Ca
         checks = [
             ("imports", True, _check_imports),
             ("digital_pdf", True, _check_digital_pdf),
+            ("image_input", True, _check_image_input),
             ("docx_export", True, lambda: _check_docx(tmp)),
             ("gui", True, lambda: _check_gui(window_factory)),
             ("tesseract_ocr", False, lambda: _check_tesseract(tmp)),

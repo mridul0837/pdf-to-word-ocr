@@ -24,7 +24,7 @@ def test_printed_mode_ocrs_rendered_pages(fake_tesseract):
     assert result.pages[0].method == METHOD_TESSERACT
     call = fake_tesseract.calls[0]
     assert call["lang"] == "eng"
-    assert call["config"] == "--psm 3"
+    assert call["api"] == "txt+tsv"  # one Tesseract run returns text and confidences
     assert call["cmd"] == fake_tesseract.cmd
     # US Letter (8.5 x 11 in) rendered at 200 DPI.
     assert call["size"] == (1700, 2200)
@@ -86,6 +86,39 @@ def test_ocr_failure_on_one_page_is_reported_and_processing_continues(fake_tesse
     assert [p.text for p in result.pages] == ["page 1 ok", "", "page 3 ok"]
     assert result.pages[1].method == METHOD_FAILED
     assert "Tesseract failed: Image too large" in result.pages[1].warnings[0]
+
+
+@pytest.mark.parametrize("mode", [MODE_PRINTED, MODE_AUTO])
+def test_low_confidence_page_suggests_handwriting_mode(fake_tesseract, mode):
+    fake_tesseract.confidence = 47.0  # what Tesseract reported on a real handwritten letter
+    fake_tesseract.responder = lambda image, i: "1 ZS Ock VA From: Venel TCO"
+    result = process_pdf(image_pdf([text_image("x")]), mode, tesseract_cmd=fake_tesseract.cmd)
+    page = result.pages[0]
+    assert page.text == "1 ZS Ock VA From: Venel TCO"  # text is still returned
+    assert len(page.warnings) == 1
+    assert "Low OCR confidence (47%)" in page.warnings[0]
+    assert "use Handwriting mode" in page.warnings[0]
+
+
+def test_confident_page_has_no_hint(fake_tesseract):
+    fake_tesseract.confidence = 96.0
+    result = process_pdf(image_pdf([text_image("x")]), MODE_PRINTED, tesseract_cmd=fake_tesseract.cmd)
+    assert result.pages[0].warnings == []
+
+
+def test_mean_word_confidence_ignores_non_word_rows():
+    from conftest import TSV_HEADER
+
+    tsv = "\n".join([
+        TSV_HEADER,
+        "1\t1\t0\t0\t0\t0\t0\t0\t9\t9\t-1\t",        # page row
+        "5\t1\t1\t1\t1\t1\t0\t0\t9\t9\t90.5\tHello",
+        "5\t1\t1\t1\t1\t2\t0\t0\t9\t9\t40\tw0rld",
+        "5\t1\t1\t1\t1\t3\t0\t0\t9\t9\t95\t ",        # empty word
+        "5\t1\t1\t1\t1\t4\t0\t0\t9\t9\t-1\tx",        # no confidence
+    ])
+    assert pipeline.mean_word_confidence(tsv) == pytest.approx(65.25)
+    assert pipeline.mean_word_confidence(TSV_HEADER) is None
 
 
 def test_missing_language_data_is_a_clear_error(fake_tesseract):

@@ -68,6 +68,47 @@ def test_password_protected_pdf_is_rejected():
         process_pdf(data)
 
 
+def image_bytes(fmt, size=(600, 800), frames=1):
+    import io
+
+    from PIL import Image
+
+    images = [Image.new("RGB", size, (255, 255 - 50 * i, 255)) for i in range(frames)]
+    buf = io.BytesIO()
+    images[0].save(buf, format=fmt, save_all=frames > 1, append_images=images[1:])
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG", "BMP", "GIF", "TIFF", "WEBP"])
+def test_images_are_accepted_as_one_page(fmt):
+    doc = open_pdf(image_bytes(fmt))
+    assert doc.is_pdf and doc.page_count == 1
+    pix = doc[0].get_pixmap(dpi=96)  # images without DPI metadata are treated as 96 DPI
+    assert (pix.width, pix.height) == (600, 800)
+    doc.close()
+
+
+def test_multipage_tiff_gives_one_page_per_frame():
+    doc = open_pdf(image_bytes("TIFF", frames=3))
+    assert doc.page_count == 3
+    doc.close()
+
+
+def test_png_saved_with_pdf_extension_is_processed(tmp_path, fake_tesseract):
+    # A real case: a scanned page saved as PNG but named "output-1.pdf".
+    from conftest import png_bytes, text_image
+
+    path = tmp_path / "output-1.pdf"
+    path.write_bytes(png_bytes(text_image("scanned")))
+    result = process_pdf(path, "Printed Text", tesseract_cmd=fake_tesseract.cmd)
+    assert [p.text for p in result.pages] == ["Recognized printed text 1"]
+
+
+def test_damaged_image_is_rejected():
+    with pytest.raises(PDFOpenError, match="not a valid PDF or image"):
+        process_pdf(image_bytes("JPEG")[:300])
+
+
 def test_unknown_mode_is_rejected():
     with pytest.raises(ValueError, match="Unknown mode"):
         process_pdf(digital_pdf(["text"]), mode="Magic")

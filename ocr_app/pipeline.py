@@ -7,6 +7,7 @@ model only produces an error when the feature that needs it is actually used.
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ from typing import Callable, Optional, Sequence, Union
 import pymupdf
 from PIL import Image
 
+from .reflow import build_vocabulary, page_paragraphs, reflow_text
 from .utils import app_base_dir, clean_text, page_marker
 
 MODE_AUTO = "Auto"
@@ -37,6 +39,18 @@ MIN_DPI, MAX_DPI = 72, 600
 MAX_RENDER_PIXELS = 40_000_000
 # Embedded text with at least this many non-space characters is trusted in Auto mode.
 MIN_EMBEDDED_CHARS = 20
+# Mean Tesseract word confidence below this triggers a "handwritten?" hint. Measured:
+# printed pages ~96, a real handwritten letter 47.
+LOW_OCR_CONFIDENCE = 65
+
+# Text-layer extraction flags: expand typographic ligatures ("ﬁ" -> "fi") so the Word
+# text is searchable and spell-checkable; skip image data in "dict" output.
+TEXT_FLAGS = pymupdf.TEXTFLAGS_TEXT & ~pymupdf.TEXT_PRESERVE_LIGATURES
+DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_LIGATURES & ~pymupdf.TEXT_PRESERVE_IMAGES
+
+# Besides PDFs, these image types are accepted (each image / TIFF frame = one page).
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp")
+SUPPORTED_EXTENSIONS = (".pdf",) + IMAGE_EXTENSIONS
 
 TESSERACT_EXE = "tesseract.exe" if os.name == "nt" else "tesseract"
 _LANGUAGE_RE = re.compile(r"^[A-Za-z0-9_]+(\+[A-Za-z0-9_]+)*$")
@@ -119,9 +133,14 @@ def normalize_mode(mode: str) -> str:
 
 
 def open_pdf(source: PdfSource) -> pymupdf.Document:
-    """Open a PDF from a path or bytes, raising PDFOpenError with a readable message."""
+    """Open a PDF or an image file (path or bytes) as a PDF document.
+
+    Images, including image files that merely carry a .pdf extension, become a
+    PDF with one page per image (or TIFF frame). Anything else raises
+    PDFOpenError with a readable message.
+    """
     if isinstance(source, (bytes, bytearray, memoryview)):
-        data, name = bytes(source), "The PDF data"
+        data, name = bytes(source), "The input"
     else:
         path = Path(source)
         name = path.name or str(path)
@@ -133,13 +152,7 @@ def open_pdf(source: PdfSource) -> pymupdf.Document:
             raise PDFOpenError(f"Could not read {name}: {exc}") from exc
     if not data.strip():
         raise PDFOpenError(f"{name} is empty (0 bytes).")
-    try:
-        doc = pymupdf.open(stream=data, filetype="pdf")
-    except Exception as exc:  # PyMuPDF raises several unrelated types here
-        raise PDFOpenError(f"{name} is not a valid PDF or is damaged ({exc}).") from exc
-    if not doc.is_pdf:  # MuPDF sniffs content and may open e.g. image data despite filetype="pdf"
-        doc.close()
-        raise PDFOpenError(f"{name} is not a valid PDF (it looks like a different file type).")
+    doc = _open_as_pdf(data, name)
     if doc.needs_pass:
         doc.close()
         raise PDFOpenError(f"{name} is password-protected. Remove the password and try again.")
@@ -147,6 +160,43 @@ def open_pdf(source: PdfSource) -> pymupdf.Document:
         doc.close()
         raise PDFOpenError(f"{name} contains no readable pages (the file may be damaged).")
     return doc
+
+
+def _open_as_pdf(data: bytes, name: str) -> pymupdf.Document:
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception:  # PyMuPDF raises several unrelated types here
+        doc = None  # maybe an image format only Pillow reads (e.g. WebP)
+    if doc is not None and doc.is_pdf:
+        return doc
+    # MuPDF sniffs the content, so image data opens as an image document even
+    # with filetype="pdf". Convert it, and render the first page once so that
+    # damaged image data is rejected here rather than half-way through a run.
+    try:
+        pdf = pymupdf.open(stream=doc.convert_to_pdf(), filetype="pdf") if doc else _images_to_pdf(data)
+        pdf[0].get_pixmap(matrix=pymupdf.Matrix(0.1, 0.1))
+        return pdf
+    except Exception as exc:
+        raise PDFOpenError(f"{name} is not a valid PDF or image file, or it is damaged.") from exc
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def _images_to_pdf(data: bytes) -> pymupdf.Document:
+    """Pillow fallback for image formats MuPDF does not read; one page per frame."""
+    from PIL import ImageSequence
+
+    pdf = pymupdf.open()
+    with Image.open(io.BytesIO(data)) as img:
+        dpi = img.info.get("dpi", (96, 96))[0] or 96
+        dpi = dpi if 30 <= dpi <= 2400 else 96
+        for frame in ImageSequence.Iterator(img):
+            buf = io.BytesIO()
+            frame.convert("RGB").save(buf, format="PNG")
+            page = pdf.new_page(width=frame.width * 72 / dpi, height=frame.height * 72 / dpi)
+            page.insert_image(page.rect, stream=buf.getvalue())
+    return pdf
 
 
 def render_page(page: pymupdf.Page, dpi: int) -> Image.Image:
@@ -169,8 +219,8 @@ def _non_space_len(text: str) -> int:
 
 TESSERACT_HELP = (
     "Tesseract OCR was not found. Install it (for example the UB Mannheim build from "
-    "https://github.com/UB-Mannheim/tesseract/wiki) or set the path to tesseract.exe "
-    "in the app's Settings, or via the TESSERACT_CMD environment variable."
+    "https://github.com/UB-Mannheim/tesseract/wiki), put a copy in a 'tesseract' folder "
+    "next to the app, or set the TESSERACT_CMD environment variable to tesseract.exe."
 )
 
 
@@ -290,15 +340,38 @@ class TesseractOCR:
         self.cmd = cmd
 
     def recognize(self, image: Image.Image) -> str:
+        return self.recognize_with_confidence(image)[0]
+
+    def recognize_with_confidence(self, image: Image.Image) -> tuple[str, Optional[float]]:
+        """Return the text and the mean word confidence (0-100, None if unknown)."""
         self.ensure_ready()
         pytesseract = _import_pytesseract()
         pytesseract.pytesseract.tesseract_cmd = self.cmd
         try:
-            return pytesseract.image_to_string(image, lang=self.language, config=f"--psm {self.psm}")
+            if self.psm == 3:  # Tesseract's default mode: one run yields both text and TSV
+                text, tsv = pytesseract.run_and_get_multiple_output(
+                    image, extensions=["txt", "tsv"], lang=self.language
+                )
+                return text, mean_word_confidence(tsv)
+            return pytesseract.image_to_string(image, lang=self.language, config=f"--psm {self.psm}"), None
         except pytesseract.TesseractNotFoundError as exc:
             raise TesseractNotFoundError(f"Tesseract at {self.cmd} could not be run.") from exc
         except pytesseract.TesseractError as exc:
             raise OCRError(f"Tesseract failed: {exc.message or exc}") from exc
+
+
+def mean_word_confidence(tsv: str) -> Optional[float]:
+    """Average confidence of the recognised words in Tesseract TSV output."""
+    confidences = []
+    for row in tsv.splitlines()[1:]:
+        cols = row.split("\t")
+        if len(cols) == 12 and cols[0] == "5" and cols[11].strip():
+            try:
+                confidences.append(float(cols[10]))
+            except ValueError:
+                continue
+    confidences = [c for c in confidences if c >= 0]
+    return sum(confidences) / len(confidences) if confidences else None
 
 
 # --------------------------------------------------------------------------- handwriting
@@ -351,7 +424,34 @@ def segment_lines(image: Image.Image) -> list[Box]:
                 continue
         lines.append([x, y, w, h])
     lines.sort(key=lambda b: b[1])
-    return [tuple(b) for b in lines]
+    return [tuple(b) for b in _merge_small_marks(lines)]
+
+
+def _merge_small_marks(lines: list[list[int]]) -> list[list[int]]:
+    """Attach marks much shorter than a text line (quote marks, accents, dots above a
+    line) to the nearest line, so they are not sent to the model on their own; the
+    model would otherwise invent a word for them."""
+    if len(lines) < 2:
+        return lines
+    median_h = sorted(b[3] for b in lines)[len(lines) // 2]
+    lines = [list(b) for b in lines]
+    while True:
+        small = [i for i, b in enumerate(lines) if b[3] < 0.5 * median_h]
+        candidates = []
+        for i in small:
+            x, y, w, h = lines[i]
+            for j, (_ox, oy, _ow, oh) in enumerate(lines):
+                if j != i and lines[j][3] >= 0.5 * median_h:
+                    gap = max(0, max(y, oy) - min(y + h, oy + oh))
+                    if gap <= 0.6 * median_h:
+                        candidates.append((gap, i, j))
+        if not candidates:
+            return lines
+        _gap, i, j = min(candidates)
+        (x, y, w, h), (ox, oy, ow, oh) = lines[i], lines[j]
+        nx, ny = min(x, ox), min(y, oy)
+        lines[j] = [nx, ny, max(x + w, ox + ow) - nx, max(y + h, oy + oh) - ny]
+        del lines[i]
 
 
 def crop_line(image: Image.Image, box: Box) -> Image.Image:
@@ -362,12 +462,19 @@ def crop_line(image: Image.Image, box: Box) -> Image.Image:
     ).convert("RGB")
 
 
-_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:!?])")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:!?)\]])")
+_SPACE_AFTER_BRACKET_RE = re.compile(r"([(\[])\s+")
+_QUOTED_RE = re.compile(r'"\s*([^"]*?)\s*"')
 
 
 def tidy_trocr_text(text: str) -> str:
-    """TrOCR (trained on IAM) emits tokenised text like 'fox , then .'; join the punctuation."""
-    return _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text).strip()
+    """TrOCR (trained on IAM) emits tokenised text like 'fox , then .', '2 )' and
+    '" quoted "'; join the punctuation to the words it belongs to."""
+    text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
+    text = _SPACE_AFTER_BRACKET_RE.sub(r"\1", text)
+    if text.count('"') % 2 == 0:
+        text = _QUOTED_RE.sub(r'"\1"', text)
+    return text.strip()
 
 
 def resolve_model_source(model_id: str) -> str:
@@ -409,7 +516,7 @@ class HandwritingRecognizer:
         device: Optional[str] = None,
         processor=None,
         model=None,
-        batch_size: int = 4,
+        batch_size: int = 8,
         max_new_tokens: int = 128,
     ):
         self.model_id = (model_id or DEFAULT_HANDWRITING_MODEL).strip()
@@ -458,8 +565,8 @@ class HandwritingRecognizer:
             if not self.allow_download:
                 raise HandwritingModelError(
                     f"The handwriting model '{source}' is not in the local cache and downloading "
-                    "is disabled. Enable 'Allow model download' in Settings (needs internet once, "
-                    "about 1.3 GB), or run: python -m ocr_app.fetch_model"
+                    "is disabled. Allow the download (needs internet once, about 1.3 GB), or "
+                    "run: python -m ocr_app.fetch_model"
                 ) from local_exc
             status(f"Downloading handwriting model {source} (about 1.3 GB, first use only)…")
             try:
@@ -492,16 +599,19 @@ class HandwritingRecognizer:
 
         self.load()
         pixel_values = self.processor(images=list(crops), return_tensors="pt").pixel_values
+        # The checkpoint's generation config disables the KV cache; enabling it gives
+        # identical text about 2.4x faster (measured on a 26-line page on CPU).
+        options = {"max_new_tokens": self.max_new_tokens, "use_cache": True}
         try:
             with torch.inference_mode():
-                ids = self.model.generate(pixel_values.to(self.device), max_new_tokens=self.max_new_tokens)
+                ids = self.model.generate(pixel_values.to(self.device), **options)
         except RuntimeError as exc:
             if self.device == "cpu" or "out of memory" not in str(exc).lower():
                 raise
             torch.cuda.empty_cache()
             self._place_model("cpu")
             with torch.inference_mode():
-                ids = self.model.generate(pixel_values.to("cpu"), max_new_tokens=self.max_new_tokens)
+                ids = self.model.generate(pixel_values.to("cpu"), **options)
         return [tidy_trocr_text(t) for t in self.processor.batch_decode(ids, skip_special_tokens=True)]
 
     def recognize_page(
@@ -556,19 +666,24 @@ def process_pdf(
     tesseract_cmd: Optional[str] = None,
     handwriting_model: str = DEFAULT_HANDWRITING_MODEL,
     allow_model_download: bool = True,
+    join_lines: bool = True,
     printed_ocr: Optional[TesseractOCR] = None,
     handwriting_recognizer: Optional[HandwritingRecognizer] = None,
     status_callback: Optional[StatusCallback] = None,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_check: Optional[CancelCheck] = None,
 ) -> DocumentResult:
-    """Extract text from every page of a PDF.
+    """Extract text from every page of a PDF (or image).
 
     * Auto: embedded text where usable, otherwise Tesseract OCR. If Tesseract
       is unavailable, pages that need OCR get a warning instead of aborting the
       run (unless no page yields any text). Auto does not detect handwriting.
     * Printed Text: Tesseract on every rendered page.
     * Handwriting: TrOCR on every rendered page (model loaded on first use).
+
+    With ``join_lines`` the printed line breaks of embedded and Tesseract text
+    are joined into paragraphs and hyphenated words repaired; handwriting
+    output always keeps one line per handwritten line.
 
     Configuration problems (missing Tesseract/model, cancelled) raise; other
     per-page failures are recorded as page warnings and processing continues.
@@ -583,10 +698,11 @@ def process_pdf(
         if cancel_check and cancel_check():
             raise ProcessingCancelled()
 
-    status("Opening PDF…")
+    status("Opening file…")
     doc = open_pdf(source)
     pages: list[PageResult] = []
     try:
+        paragraphs = _Paragraphs(doc, join_lines and mode != MODE_HANDWRITING)
         total = doc.page_count
         progress(0, total)
         for index in range(total):
@@ -607,10 +723,11 @@ def process_pdf(
                     result = PageResult(number, clean_text(text), METHOD_TROCR)
                 elif mode == MODE_PRINTED:
                     status(f"{prefix}: running Tesseract OCR…")
-                    text = printed.recognize(render_page(page, dpi))
-                    result = PageResult(number, clean_text(text), METHOD_TESSERACT)
+                    text, confidence = printed.recognize_with_confidence(render_page(page, dpi))
+                    result = PageResult(number, paragraphs.ocr(text), METHOD_TESSERACT)
+                    _add_confidence_hint(result, confidence)
                 else:
-                    result = _process_auto_page(page, number, dpi, printed, status, prefix)
+                    result = _process_auto_page(page, number, dpi, printed, status, prefix, paragraphs)
             except (ProcessingCancelled, HandwritingModelError, TesseractNotFoundError, TesseractLanguageError):
                 raise
             except Exception as exc:
@@ -628,21 +745,54 @@ def process_pdf(
     return DocumentResult(pages=pages, mode=mode)
 
 
-def _process_auto_page(page, number, dpi, printed: TesseractOCR, status, prefix) -> PageResult:
-    embedded = clean_text(page.get_text("text"))
+class _Paragraphs:
+    """Produces page text, joined into paragraphs when enabled."""
+
+    def __init__(self, doc: pymupdf.Document, join: bool):
+        self.join = join
+        # Vocabulary of the whole text layer, used to repair hyphenated line ends.
+        self.vocabulary = build_vocabulary(p.get_text("text", flags=TEXT_FLAGS) for p in doc) if join else set()
+
+    def embedded(self, page: pymupdf.Page) -> str:
+        if not self.join:
+            return clean_text(page.get_text("text", flags=TEXT_FLAGS))
+        return clean_text(page_paragraphs(page, self.vocabulary, DICT_FLAGS))
+
+    def ocr(self, text: str) -> str:
+        text = clean_text(text)
+        if not self.join or not text:
+            return text
+        self.vocabulary |= build_vocabulary([text])
+        return clean_text(reflow_text(text, self.vocabulary))
+
+
+def _process_auto_page(page, number, dpi, printed: TesseractOCR, status, prefix, paragraphs: _Paragraphs) -> PageResult:
+    embedded = clean_text(page.get_text("text", flags=TEXT_FLAGS))
     has_images = bool(page.get_images(full=False))
     if _non_space_len(embedded) >= MIN_EMBEDDED_CHARS or (embedded and not has_images):
-        return PageResult(number, embedded, METHOD_EMBEDDED)
+        return PageResult(number, paragraphs.embedded(page), METHOD_EMBEDDED)
 
     status(f"{prefix}: no usable embedded text, running Tesseract OCR…")
     try:
-        ocr_text = clean_text(printed.recognize(render_page(page, dpi)))
+        ocr_text, confidence = printed.recognize_with_confidence(render_page(page, dpi))
+        ocr_text = paragraphs.ocr(ocr_text)
     except (TesseractNotFoundError, TesseractLanguageError) as exc:
         first_line = str(exc).splitlines()[0]
         warning = f"Page needs OCR but Tesseract is unavailable: {first_line}"
         if embedded:
-            return PageResult(number, embedded, METHOD_EMBEDDED, [warning])
+            return PageResult(number, paragraphs.embedded(page), METHOD_EMBEDDED, [warning])
         return PageResult(number, "", METHOD_TESSERACT, [warning])
     if not ocr_text and embedded:
-        return PageResult(number, embedded, METHOD_EMBEDDED + " (OCR found nothing)")
-    return PageResult(number, ocr_text, METHOD_TESSERACT)
+        return PageResult(number, paragraphs.embedded(page), METHOD_EMBEDDED + " (OCR found nothing)")
+    return _add_confidence_hint(PageResult(number, ocr_text, METHOD_TESSERACT), confidence)
+
+
+def _add_confidence_hint(result: PageResult, confidence: Optional[float]) -> PageResult:
+    """Tesseract reads handwriting poorly and with low confidence; say so instead of
+    silently returning gibberish. This is a hint, not handwriting detection."""
+    if result.text and confidence is not None and confidence < LOW_OCR_CONFIDENCE:
+        result.warnings.append(
+            f"Low OCR confidence ({confidence:.0f}%). If this page is handwritten, "
+            "use Handwriting mode; otherwise try a higher DPI or a better scan."
+        )
+    return result

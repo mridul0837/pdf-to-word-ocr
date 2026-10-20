@@ -45,8 +45,6 @@ from PySide6.QtWidgets import (  # noqa: E402
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -63,21 +61,27 @@ from ocr_app import __version__  # noqa: E402
 from ocr_app.docx_export import ExportError, export_docx  # noqa: E402
 from ocr_app.pipeline import (  # noqa: E402
     DEFAULT_DPI,
-    DEFAULT_HANDWRITING_MODEL,
     MODE_AUTO,
     MODE_HANDWRITING,
     MODE_PRINTED,
     MODES,
     OCRError,
+    SUPPORTED_EXTENSIONS,
     ProcessingCancelled,
     process_pdf,
-    tesseract_version,
 )
 from ocr_app.utils import APP_NAME  # noqa: E402
 
+FILE_FILTER = "PDFs and images ({});;All files (*)".format(" ".join("*" + e for e in SUPPORTED_EXTENSIONS))
+
+
+def is_supported_file(path: str) -> bool:
+    return path.lower().endswith(SUPPORTED_EXTENSIONS)
+
 MODE_HINTS = {
-    MODE_AUTO: "Uses the PDF's embedded text where present and Tesseract OCR for scanned pages. "
-    "Auto does not detect handwriting — choose Handwriting for handwritten pages.",
+    MODE_AUTO: "Uses a PDF's embedded text where present and Tesseract OCR for scans and images. "
+    "Auto does not switch to handwriting recognition — choose Handwriting for handwritten pages "
+    "(pages that OCR with low confidence get a warning).",
     MODE_PRINTED: "Runs Tesseract OCR on every page, ignoring any embedded text. "
     "Best for scanned typed or printed documents.",
     MODE_HANDWRITING: "Runs the TrOCR handwriting model (English) on every page, line by line. "
@@ -147,7 +151,7 @@ class MainWindow(QMainWindow):
         title = QLabel("PDF to Word OCR")
         title.setObjectName("title")
         subtitle = QLabel(
-            "Convert digital PDFs, scanned documents and handwriting into editable Word documents. "
+            "Convert PDFs and images — digital, scanned or handwritten — into editable Word documents. "
             "All processing happens locally on this computer."
         )
         subtitle.setObjectName("subtitle")
@@ -156,9 +160,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
 
         file_row = QHBoxLayout()
-        self.choose_btn = QPushButton("Choose PDF…")
+        self.choose_btn = QPushButton("Choose file…")
         self.choose_btn.clicked.connect(self.choose_pdf)
-        self.file_label = QLabel("No PDF selected (you can also drop a PDF onto this window)")
+        self.file_label = QLabel("No file selected — choose a PDF or image (PNG, JPG, TIFF…), or drop one onto this window")
         self.file_label.setObjectName("fileLabel")
         self.file_label.setWordWrap(True)
         file_row.addWidget(self.choose_btn)
@@ -194,6 +198,14 @@ class MainWindow(QMainWindow):
         self.dpi.addItems(["150", "200", "250", "300", "350", "400"])
         self.dpi.setToolTip("Rendering resolution for OCR. 250–300 suits most scans.")
         options.addWidget(self.dpi)
+        options.addSpacing(14)
+        self.join_lines = QCheckBox("Join lines into paragraphs")
+        self.join_lines.setToolTip(
+            "Rebuild paragraphs from the printed line breaks and repair words split with a hyphen,\n"
+            "so the Word text reflows when edited. Turn off to keep every original line\n"
+            "(poems, addresses, lists). Handwriting always keeps one line per written line."
+        )
+        options.addWidget(self.join_lines)
         options.addStretch(1)
         layout.addLayout(options)
 
@@ -201,27 +213,6 @@ class MainWindow(QMainWindow):
         self.mode_hint.setObjectName("hint")
         self.mode_hint.setWordWrap(True)
         layout.addWidget(self.mode_hint)
-
-        settings_box = QGroupBox("Settings")
-        form = QFormLayout(settings_box)
-        tess_row = QHBoxLayout()
-        self.tesseract_edit = QLineEdit()
-        self.tesseract_edit.setPlaceholderText("Auto-detect (PATH, TESSERACT_CMD or standard install folder)")
-        self.tesseract_browse_btn = QPushButton("Browse…")
-        self.tesseract_browse_btn.clicked.connect(self.choose_tesseract)
-        self.tesseract_test_btn = QPushButton("Test")
-        self.tesseract_test_btn.clicked.connect(self.test_tesseract)
-        tess_row.addWidget(self.tesseract_edit, 1)
-        tess_row.addWidget(self.tesseract_browse_btn)
-        tess_row.addWidget(self.tesseract_test_btn)
-        form.addRow("Tesseract executable", tess_row)
-        self.model_edit = QLineEdit()
-        self.model_edit.setPlaceholderText(DEFAULT_HANDWRITING_MODEL)
-        self.model_edit.setToolTip("Hugging Face model id or a local model folder.")
-        form.addRow("Handwriting model", self.model_edit)
-        self.allow_download = QCheckBox("Allow downloading the handwriting model if it is not cached (needs internet once)")
-        form.addRow("", self.allow_download)
-        layout.addWidget(settings_box)
 
         action_row = QHBoxLayout()
         self.process_btn = QPushButton("Extract text")
@@ -286,28 +277,26 @@ class MainWindow(QMainWindow):
         self.language.setCurrentText(s.value("language", "eng", type=str) or "eng")
         dpi = s.value("dpi", str(DEFAULT_DPI), type=str)
         self.dpi.setCurrentText(dpi if self.dpi.findText(dpi) >= 0 else str(DEFAULT_DPI))
-        self.tesseract_edit.setText(s.value("tesseract_cmd", "", type=str))
-        self.model_edit.setText(s.value("handwriting_model", "", type=str))
-        self.allow_download.setChecked(s.value("allow_download", True, type=bool))
+        self.join_lines.setChecked(s.value("join_lines", True, type=bool))
 
     def save_settings(self) -> None:
         s = self.settings
         s.setValue("mode", self.mode.currentText())
         s.setValue("language", self.language.currentText().strip())
         s.setValue("dpi", self.dpi.currentText())
-        s.setValue("tesseract_cmd", self.tesseract_edit.text().strip())
-        s.setValue("handwriting_model", self.model_edit.text().strip())
-        s.setValue("allow_download", self.allow_download.isChecked())
+        s.setValue("join_lines", self.join_lines.isChecked())
         s.sync()
 
     def processing_options(self) -> dict:
+        # Engines use their defaults: Tesseract is found automatically (a "tesseract" folder
+        # beside the app, TESSERACT_CMD, PATH or the standard install folder) and the default
+        # handwriting model is loaded from beside the app or the local cache, downloaded once
+        # if missing.
         return {
             "mode": self.mode.currentText(),
             "language": self.language.currentText().strip() or "eng",
             "dpi": int(self.dpi.currentText()),
-            "tesseract_cmd": self.tesseract_edit.text().strip() or None,
-            "handwriting_model": self.model_edit.text().strip() or DEFAULT_HANDWRITING_MODEL,
-            "allow_model_download": self.allow_download.isChecked(),
+            "join_lines": self.join_lines.isChecked(),
         }
 
     # ------------------------------------------------------------------ dialogs (overridable in tests)
@@ -332,7 +321,7 @@ class MainWindow(QMainWindow):
 
     def choose_pdf(self) -> None:
         start = str(Path(self.pdf_path).parent) if self.pdf_path else self.settings.value("last_dir", "", type=str)
-        path, _ = QFileDialog.getOpenFileName(self, "Select PDF", start, "PDF documents (*.pdf);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select a PDF or image", start, FILE_FILTER)
         if path:
             self.set_pdf(path)
 
@@ -369,31 +358,14 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(str(Path(path)))
             self._auto_output = False
 
-    def choose_tesseract(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Locate tesseract.exe", self.tesseract_edit.text(), "Tesseract (tesseract.exe tesseract);;All files (*)"
-        )
-        if path:
-            self.tesseract_edit.setText(str(Path(path)))
-
-    def test_tesseract(self) -> None:
-        try:
-            version = tesseract_version(self.tesseract_edit.text().strip() or None)
-        except OCRError as exc:
-            self.status_label.setText("Tesseract not available.")
-            self._warn("Tesseract not available", str(exc))
-            return
-        self.status_label.setText(f"Tesseract {version} is available.")
-        self._info("Tesseract found", f"Tesseract {version} is available.")
-
     def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt override)
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-        if any(u.toLocalFile().lower().endswith(".pdf") for u in urls) and not self.is_busy:
+        if any(is_supported_file(u.toLocalFile()) for u in urls) and not self.is_busy:
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # noqa: N802 (Qt override)
         for url in event.mimeData().urls():
-            if url.toLocalFile().lower().endswith(".pdf"):
+            if is_supported_file(url.toLocalFile()):
                 self.set_pdf(url.toLocalFile())
                 break
 
@@ -410,8 +382,7 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         for widget in (
             self.choose_btn, self.process_btn, self.mode, self.language, self.dpi,
-            self.tesseract_edit, self.tesseract_browse_btn, self.tesseract_test_btn,
-            self.model_edit, self.allow_download, self.preview,
+            self.join_lines, self.preview,
         ):
             widget.setEnabled(not busy)
         if not busy:
@@ -426,10 +397,10 @@ class MainWindow(QMainWindow):
         if self.is_busy:
             return False
         if not self.pdf_path:
-            self._info("Choose a PDF", "Please choose a PDF file first.")
+            self._info("Choose a file", "Please choose a PDF or image file first.")
             return False
         if not Path(self.pdf_path).is_file():
-            self._warn("File not found", f"The selected PDF no longer exists:\n{self.pdf_path}")
+            self._warn("File not found", f"The selected file no longer exists:\n{self.pdf_path}")
             return False
         if self.preview.document().isModified() and self.preview.toPlainText().strip():
             if not self._confirm("Replace edited text?", "Extracting again replaces the edited text. Continue?"):
@@ -566,8 +537,6 @@ class MainWindow(QMainWindow):
             QLabel#sectionTitle { font-weight: 600; font-size: 11pt; margin-top: 4px; }
             QLabel#status { color: #42526a; }
             QLabel#footnote { color: #697586; font-size: 9pt; }
-            QGroupBox { border: 1px solid #dde3ec; border-radius: 8px; margin-top: 10px; padding: 10px 8px 6px 8px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #465368; }
             QPushButton { background: white; border: 1px solid #cbd4e1; border-radius: 7px; padding: 8px 14px; }
             QPushButton:hover { background: #edf3fa; }
             QPushButton:disabled { color: #9aa4b2; background: #eef1f5; }
@@ -595,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("PDF to Word OCR")
     app.setOrganizationName(APP_NAME)
     window = MainWindow()
-    pdf_args = [a for a in argv[1:] if a.lower().endswith(".pdf")]
+    pdf_args = [a for a in argv[1:] if is_supported_file(a)]
     if pdf_args:
         window.set_pdf(pdf_args[0])
     window.show()

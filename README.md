@@ -1,221 +1,127 @@
-# PDF to Word OCR — Windows desktop app
+# PDF to Word OCR
 
-A native Windows desktop application (Python + PySide6) that turns PDFs into editable
-Microsoft Word (`.docx`) files. All processing is local: no cloud OCR, no paid APIs.
+**Private, on-device conversion of PDFs and images into editable Word documents.**
+Text extraction, OCR and handwriting recognition all run on your own Windows PC, and
+nothing is uploaded.
 
-- **Digital PDFs**: the embedded text layer is extracted directly (PyMuPDF).
-- **Scanned printed documents**: OCR with [Tesseract](https://github.com/tesseract-ocr/tesseract).
-- **Handwritten documents**: line-by-line recognition with the pretrained
-  [`microsoft/trocr-base-handwritten`](https://huggingface.co/microsoft/trocr-base-handwritten) model.
+![PDF to Word OCR](docs/screenshot.png)
 
-The recognized text appears in an editable preview so you can correct OCR mistakes
-before saving the Word document.
+## Why on-device
 
-## Recognition modes
+Online converters upload your files to someone else's server. This app is for documents
+you would rather keep to yourself, such as contracts, medical letters, IDs and notes:
 
-| Mode | What it does | Needs |
+- no account, no upload, no tracking;
+- works offline;
+- makes one network request at most: a one-time download of the handwriting model from
+  Hugging Face, and only if the model isn't already on the PC. The portable build
+  includes it, so that build never goes online.
+
+## Features
+
+| Mode | Use it for | How it works |
 |---|---|---|
-| **Auto** (default) | Uses each page's embedded text when it has some; pages without usable text (scans) are OCR'd with Tesseract. | Tesseract only for scanned pages |
-| **Printed Text** | Renders every page and OCRs it with Tesseract, ignoring any embedded text. | Tesseract |
-| **Handwriting** | Renders every page, finds text lines with OpenCV and reads each line with TrOCR. | TrOCR model (downloaded once, ~1.3 GB) |
+| **Auto** | Digital PDFs, scanned printed pages | Uses the PDF's own text; pages without text are OCR'd with [Tesseract](https://github.com/tesseract-ocr/tesseract) |
+| **Printed Text** | Scanned typed or printed documents | Tesseract on every page |
+| **Handwriting** | Handwritten pages (English) | [TrOCR](https://huggingface.co/microsoft/trocr-base-handwritten), line by line |
 
-**Auto mode does not detect handwriting.** A handwritten scan in Auto mode is sent to
-Tesseract, which handles handwriting poorly. Choose **Handwriting** yourself for handwritten pages.
-A PDF that mixes printed and handwritten pages has to be processed twice (once per mode),
-or the pages split up.
+- Opens PDFs and images (PNG, JPG, TIFF, BMP, GIF, WEBP).
+- Shows the recognized text for review and editing before saving it as `.docx`.
+- Turns printed line breaks back into paragraphs and rejoins words split by a hyphen, so
+  the Word text reflows when edited. Untick *Join lines into paragraphs* to keep the
+  original line breaks.
+- Runs in the background with progress and cancel. Uses an NVIDIA GPU when available,
+  otherwise the CPU.
+- Auto mode does **not** detect handwriting. When Tesseract's confidence on a page is
+  low, the app suggests switching to Handwriting mode.
 
-In Auto mode, if Tesseract is missing, digital pages are still extracted and the scanned
-pages are listed in a warning. If no page yields any text, the run fails with the
-"Tesseract not found" message.
+## Results
 
-## Requirements
+Measured on single documents (not a benchmark):
 
-- Windows 10 or 11, 64-bit
-- Python 3.11–3.13 (developed and tested with 3.13.9)
-- Tesseract OCR 5.x with language data, for Auto/Printed modes on scanned pages
-- About 1.3 GB of disk space and a one-time internet connection for the handwriting model
-- Optional: an NVIDIA GPU with a CUDA build of PyTorch, to speed up handwriting.
-  The app falls back to the CPU automatically when CUDA is unavailable.
+| Document | Mode | Result |
+|---|---|---|
+| Handwritten letter, 26 lines, ~130 DPI scan | Handwriting | 1.0% characters wrong, 4.4% words wrong, ~20 s on an 8-core CPU |
+| Same letter | Auto (Tesseract) | 96% words wrong, plus a "use Handwriting mode" warning |
+| 12-page two-column research paper (digital PDF) | Auto | Exact text in under 1 s; 1,478 line fragments become 266 paragraphs |
+| Same paper, pages as images | Printed Text | About 1% words wrong on plain text pages |
 
-## 1. Set up the Python environment (PowerShell)
+## Download and run
+
+The portable Windows build needs no installation and works offline: Tesseract and the
+handwriting model are inside.
+
+1. Get `PDFtoWordOCR-portable.zip` (about 1.1 GB; 2.2 GB unpacked), either from
+   [Releases](https://github.com/mridul0837/pdf-to-word-ocr/releases) when published,
+   or by [building it](#build-the-portable-app).
+2. Right-click the ZIP and choose **Extract All**, then double-click
+   `PDFtoWordOCR.exe`. Keep it inside the extracted folder.
+3. If Windows says "Windows protected your PC", choose **More info → Run anyway**. The
+   app is not code-signed.
+
+## Run from source
+
+Requires Windows 10/11 and Python 3.11–3.13.
 
 ```powershell
-cd "D:\Z. OCR App\pdf_to_word_desktop_app"     # the project folder
+git clone https://github.com/mridul0837/pdf-to-word-ocr.git
+cd pdf-to-word-ocr
 py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt   # app + pytest + PyInstaller
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+winget install --id UB-Mannheim.TesseractOCR      # printed-text OCR engine
+.\.venv\Scripts\python.exe desktop_app.py
 ```
 
-`requirements.txt` holds only the runtime dependencies. `requirements-dev.txt` adds pytest and PyInstaller.
+- **Tesseract** is found automatically, in this order: a `tesseract\` folder next to the
+  app, the `TESSERACT_CMD` environment variable, `PATH`, then the standard install folder.
+- **Handwriting model** (~1.3 GB) downloads on first use and is then cached. To fetch it
+  ahead of time, run `.\.venv\Scripts\python.exe -m ocr_app.fetch_model`.
+- **GPU:** for NVIDIA acceleration, install a CUDA build of PyTorch before the requirements.
 
-The examples call `.\.venv\Scripts\python.exe` directly, so the venv never needs activating.
-If you prefer to activate it (`.\.venv\Scripts\Activate.ps1`) and PowerShell blocks the
-script, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
-
-**GPU (optional):** on Windows, `pip install torch` installs a CPU-only build. For CUDA,
-first install the CUDA build of PyTorch with the command from
-<https://pytorch.org/get-started/locally/> (Windows / Pip / CUDA), then install the requirements.
-A CUDA build makes the packaged app several GB larger.
-
-## 2. Install and configure Tesseract
-
-1. Install the UB Mannheim build of Tesseract, either from
-   <https://github.com/UB-Mannheim/tesseract/wiki> or with
-   `winget install --id UB-Mannheim.TesseractOCR`.
-   Tick any extra languages you need during installation (English is included).
-2. Check it works:
-   ```powershell
-   & "C:\Program Files\Tesseract-OCR\tesseract.exe" --version
-   & "C:\Program Files\Tesseract-OCR\tesseract.exe" --list-langs
-   ```
-
-The app finds `tesseract.exe` automatically, checking these locations in order:
-
-1. The path entered in the app's **Settings → Tesseract executable** (use **Test** to check it).
-2. The `TESSERACT_CMD` environment variable.
-3. A `tesseract\` folder next to the app (or next to `PDFtoWordOCR.exe`).
-4. `PATH`.
-5. The standard install folders: `%ProgramFiles%\Tesseract-OCR`, `%ProgramFiles(x86)%\Tesseract-OCR`
-   and `%LOCALAPPDATA%\Programs\Tesseract-OCR`.
-
-If Tesseract reports no languages, its language data is not where it looks. Put the
-`*.traineddata` files in its `tessdata` folder, or set `TESSDATA_PREFIX` to the folder
-that contains them. The **Language** box accepts Tesseract codes such as `eng`, `fra`
-or `eng+fra`, and each one must be installed.
-
-## 3. Handwriting model: first download and caching
-
-The model loads only when Handwriting mode is used. The app looks in the local cache
-first, without contacting the network. Only if the weights are missing and **Settings →
-Allow downloading the handwriting model** is ticked does it download them, about 1.3 GB,
-once. They are cached in `%USERPROFILE%\.cache\huggingface\hub` (set `HF_HOME` to move
-the cache). The development setup and the packaged `.exe` share that cache, and later
-launches reuse it offline.
-
-To download ahead of time:
-
-```powershell
-.\.venv\Scripts\python.exe -m ocr_app.fetch_model
-```
-
-For a PC without internet, save a self-contained copy and put it next to the app:
-
-```powershell
-.\.venv\Scripts\python.exe -m ocr_app.fetch_model --output models\trocr-base-handwritten
-# then copy the "models" folder next to desktop_app.py or PDFtoWordOCR.exe
-```
-
-The app prefers `models\trocr-base-handwritten` beside it when that folder exists. The
-**Handwriting model** setting also accepts another Hugging Face TrOCR model id or a local folder.
-
-The model recognizes **English** handwriting only, and the Language box does not apply to it.
-
-## 4. Run the app
-
-```powershell
-.\.venv\Scripts\python.exe desktop_app.py            # or: desktop_app.py "C:\path\file.pdf"
-```
-
-1. **Choose PDF…** (or drag a PDF onto the window). The output path defaults to `<name>_ocr.docx` beside the PDF.
-2. Pick a **Mode**, plus the **Language** and **DPI** (250–300 suits most scans).
-3. Click **Extract text**. Processing runs in a background thread, so the window stays
-   responsive. The progress bar counts pages, the status line shows the current step,
-   and **Cancel** stops after the current step.
-4. Review and edit the text. Lines like `===== PAGE 2 · Tesseract OCR =====` mark page
-   boundaries and become page breaks in Word. Delete them if you don't want page breaks.
-5. Click **Save Word document**.
-
-Settings (mode, language, DPI, Tesseract path, model and download option) are remembered
-in the registry under `HKEY_CURRENT_USER\Software\PDFtoWordOCR`.
-
-## 5. Run the tests
+## Tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-The suite needs no internet, model weights, GPU or Tesseract. External engines are
-mocked, and the GUI tests run on Qt's offscreen platform. Two opt-in integration tests
-use the real engines and skip themselves otherwise:
+The suite runs offline in about 10 seconds. External engines and the GUI's dialogs are
+mocked. Tests marked `integration` use the real Tesseract, and the real TrOCR model when
+`PDFOCR_RUN_MODEL_TESTS=1` is set. They skip themselves when those are unavailable.
+
+## Build the portable app
 
 ```powershell
-$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"   # real Tesseract test
-$env:PDFOCR_RUN_MODEL_TESTS = "1"                                     # real TrOCR test (cached model)
-.\.venv\Scripts\python.exe -m pytest -m integration
+.\build_exe.ps1       # tests, PyInstaller one-folder build, self-test  -> dist\PDFtoWordOCR\
+.\make_portable.ps1   # bundles Tesseract + model, re-tests with local installs hidden -> dist\PDFtoWordOCR-portable.zip
 ```
 
-## 6. Build the Windows executable
-
-```powershell
-.\build_exe.ps1                 # tests -> PyInstaller (one-folder) -> self-test of the .exe
-.\build_exe.ps1 -SkipTests      # skip the pytest run
-.\build_exe.ps1 -Console        # console build, to see tracebacks while debugging
-```
-
-If script execution is blocked, run `powershell -ExecutionPolicy Bypass -File .\build_exe.ps1`.
-
-Output: `dist\PDFtoWordOCR\PDFtoWordOCR.exe`. The build uses `PDFtoWordOCR.spec` in
-one-folder mode, so ship or copy the **whole** `dist\PDFtoWordOCR` folder, not just the `.exe`.
-The spec bundles Qt's platform plugins, PyTorch and the transformers modules TrOCR needs.
-It leaves out PyMuPDF's optional layout/onnxruntime add-ons and unused Qt modules.
-
-To check a build on any PC:
-
-```powershell
-.\dist\PDFtoWordOCR\PDFtoWordOCR.exe --self-test report.json
-```
-
-This writes a JSON report covering imports, digital-PDF extraction, DOCX export and GUI
-start-up, plus Tesseract and the cached handwriting model when available. It never downloads anything.
-
-**Not bundled:** these must exist on the target PC.
-
-- **Tesseract**: install it there, or copy a Tesseract folder (with `tessdata`) to
-  `dist\PDFtoWordOCR\tesseract\`.
-- **TrOCR weights**: downloaded on first handwriting use, or copied as
-  `dist\PDFtoWordOCR\models\trocr-base-handwritten` (see section 3).
-
-Check the licences of Tesseract (Apache-2.0), the TrOCR model and the bundled libraries
-before redistributing the app.
+`make_portable.ps1` needs Tesseract installed on the build PC. On any PC,
+`PDFtoWordOCR.exe --self-test report.json` reports which features work there.
 
 ## Project layout
 
 ```
-desktop_app.py            PySide6 GUI and entry point (also --self-test)
-ocr_app/pipeline.py       PDF opening, page rendering, Tesseract, line segmentation, TrOCR, orchestration
-ocr_app/docx_export.py    Edited text -> .docx (page markers -> page breaks)
-ocr_app/utils.py          Text cleanup, page markers, app/user paths
-ocr_app/fetch_model.py    Pre-download / save the handwriting model
-ocr_app/selftest.py       Headless checks used to verify a build
-tests/                    pytest suite
-PDFtoWordOCR.spec         PyInstaller spec
-build_exe.ps1             Reproducible build script
+desktop_app.py          PySide6 window and entry point
+ocr_app/pipeline.py     File loading, Tesseract, line segmentation, TrOCR, orchestration
+ocr_app/reflow.py       Rebuilds paragraphs and repairs hyphenated words
+ocr_app/docx_export.py  Edited text -> .docx (page markers -> page breaks)
+ocr_app/fetch_model.py  Downloads or exports the handwriting model
+ocr_app/selftest.py     Headless checks for a built app
+tests/                  pytest suite
+build_exe.ps1, make_portable.ps1, PDFtoWordOCR.spec   Packaging
 ```
 
 ## Limitations
 
-- Layout is not preserved. The output is plain paragraphs (one per text line) with a page
-  break between pages. Columns, tables, images, fonts, headers and equations are not reconstructed.
-- Auto mode trusts any page with at least 20 characters of embedded text. A page that
-  mixes a text layer with scanned images uses only the text layer; use Printed Text mode for such files.
-- Handwriting line detection is a simple OpenCV heuristic. It works best on clearly
-  separated horizontal lines. Side-by-side columns get merged into one line, and dense
-  cursive, skewed or overlapping lines and margin notes may be split or read poorly.
-  TrOCR sometimes adds a full stop at the end of a line.
-- Handwriting recognition is slow on CPU: a few seconds per line, plus a one-time model
-  load of about 10–20 s. A GPU helps substantially.
-- Password-protected PDFs are rejected. Remove the password first.
-- OCR quality depends on scan quality. Proofread names, numbers, dates and technical content.
+- Output is clean paragraphs with page breaks. Columns, tables, images and fonts are not
+  reproduced, and text inside figures becomes separate short paragraphs.
+- Handwriting recognition is English-only and works best on clearly separated horizontal
+  lines. Always proofread names, numbers and dates.
+- Windows only; tested on Windows 10 with Python 3.13.
 
-## Troubleshooting
+## Third-party components
 
-- **"Tesseract OCR was not found"**: install Tesseract (section 2), or set its path in
-  Settings and click **Test**.
-- **"found no language data" / "language data not installed"**: add the `.traineddata`
-  files to Tesseract's `tessdata` folder, or set `TESSDATA_PREFIX`.
-- **Handwriting model errors**: tick *Allow downloading…* and connect to the internet once,
-  or run `python -m ocr_app.fetch_model`. Behind a proxy, set `HTTPS_PROXY`.
-- **The packaged app closes or misbehaves**: run `PDFtoWordOCR.exe --self-test report.json`,
-  build a console version with `.\build_exe.ps1 -Console`, and check
-  `%LOCALAPPDATA%\PDFtoWordOCR\app.log`, where library output from the windowed app is written.
-- **"Could not write … open in Word"**: close the document in Word and save again.
+The app is built on PyMuPDF (AGPL-3.0), PySide6 (LGPL-3.0), Tesseract (Apache-2.0),
+PyTorch (BSD-3-Clause), Hugging Face Transformers (Apache-2.0), OpenCV (Apache-2.0),
+python-docx (MIT) and Microsoft's TrOCR model (see its model card). Check these licences
+before redistributing builds: PyMuPDF's AGPL terms apply to distributed copies.

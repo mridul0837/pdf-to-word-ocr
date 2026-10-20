@@ -67,7 +67,7 @@ def test_blank_page_in_auto_mode_yields_warning_not_failure(fake_tesseract):
 def test_status_messages_are_reported(ocr_must_not_run):
     messages = []
     process_pdf(digital_pdf(["Enough embedded text on this page."] * 2), status_callback=messages.append)
-    assert messages[0] == "Opening PDF…"
+    assert messages[0] == "Opening file…"
     assert any("Page 2 of 2" in m for m in messages)
 
 

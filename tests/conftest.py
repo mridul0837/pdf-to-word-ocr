@@ -74,18 +74,30 @@ def image_pdf(images: list[Image.Image | None], page_size=(612, 792)) -> bytes:
 # --------------------------------------------------------------------------- Tesseract
 
 
+TSV_HEADER = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+
+
 class FakeTesseract:
     def __init__(self, exe_path: str):
         self.cmd = exe_path
         self.calls: list[dict] = []
         self.languages = ["eng", "fra", "osd"]
+        self.confidence = 95.0  # reported for every word
         self.responder = lambda image, call_index: f"Recognized printed text {call_index}"
 
-    def image_to_string(self, image, lang=None, config=""):
-        self.calls.append(
-            {"size": image.size, "lang": lang, "config": config, "cmd": pytesseract.pytesseract.tesseract_cmd}
-        )
+    def _run(self, image, lang, api):
+        self.calls.append({"size": image.size, "lang": lang, "api": api, "cmd": pytesseract.pytesseract.tesseract_cmd})
         return self.responder(image, len(self.calls))
+
+    def image_to_string(self, image, lang=None, config=""):
+        return self._run(image, lang, f"image_to_string {config}")
+
+    def run_and_get_multiple_output(self, image, extensions, lang=None, **_kwargs):
+        assert extensions == ["txt", "tsv"]
+        text = self._run(image, lang, "txt+tsv")
+        rows = [TSV_HEADER, "1\t1\t0\t0\t0\t0\t0\t0\t100\t100\t-1\t"]
+        rows += [f"5\t1\t1\t1\t1\t{i}\t0\t0\t10\t10\t{self.confidence}\t{w}" for i, w in enumerate(text.split(), 1)]
+        return [text, "\n".join(rows)]
 
 
 @pytest.fixture
@@ -97,6 +109,7 @@ def fake_tesseract(monkeypatch, tmp_path):
     fake = FakeTesseract(str(exe))
     monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
     monkeypatch.setattr(pytesseract, "image_to_string", fake.image_to_string)
+    monkeypatch.setattr(pytesseract, "run_and_get_multiple_output", fake.run_and_get_multiple_output)
     monkeypatch.setattr(pytesseract, "get_languages", lambda config="": list(fake.languages))
     return fake
 
@@ -145,6 +158,7 @@ class FakeModel:
         self.counter = 0
         self.devices: list[str] = []
         self.generate_devices: list[str] = []
+        self.generate_options: list[dict] = []
 
     def to(self, device):
         self.devices.append(str(device))
@@ -153,9 +167,10 @@ class FakeModel:
     def eval(self):
         return self
 
-    def generate(self, pixel_values, max_new_tokens):
+    def generate(self, pixel_values, max_new_tokens, **options):
         assert max_new_tokens > 0
         self.generate_devices.append(str(pixel_values.device))
+        self.generate_options.append(options)
         n = pixel_values.shape[0]
         ids = torch.arange(self.counter + 1, self.counter + n + 1).unsqueeze(1)
         self.counter += n
@@ -170,3 +185,10 @@ def fake_recognizer():
 @pytest.fixture(autouse=True)
 def _isolate_recognizer_cache(monkeypatch):
     monkeypatch.setattr(pipeline, "_recognizers", {})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_app_folder(monkeypatch, tmp_path_factory):
+    """Hide any real models\\ or tesseract\\ folder beside the app from the tests."""
+    empty = tmp_path_factory.mktemp("app_dir")
+    monkeypatch.setattr(pipeline, "app_base_dir", lambda: empty)
