@@ -71,11 +71,10 @@ def test_trocr_tokenised_punctuation_is_joined():
     assert pipeline.tidy_trocr_text(" meeting on Friday , at 3 . ") == "meeting on Friday, at 3."
     assert pipeline.tidy_trocr_text("Is it ready ?") == "Is it ready?"
     assert pipeline.tidy_trocr_text("$1,284.50 total") == "$1,284.50 total"
-    # Seen on a real handwritten letter:
-    assert pipeline.tidy_trocr_text('an " alien unprivileged enemy belligerent , "') == (
-        'an "alien unprivileged enemy belligerent,"'
+    assert pipeline.tidy_trocr_text('she wrote " see you very soon , "') == (
+        'she wrote "see you very soon,"'
     )
-    assert pipeline.tidy_trocr_text("2 ) Mr. Khan") == "2) Mr. Khan"
+    assert pipeline.tidy_trocr_text("2 ) Mr. Smith") == "2) Mr. Smith"
     assert pipeline.tidy_trocr_text("( see note )") == "(see note)"
     assert pipeline.tidy_trocr_text('he said " hello') == 'he said " hello'  # unpaired quote left alone
 
@@ -83,7 +82,7 @@ def test_trocr_tokenised_punctuation_is_joined():
 def test_small_mark_above_a_line_joins_that_line():
     import cv2
 
-    image = handwriting_image(["first line here", "an alien enemy", "third line"])
+    image = handwriting_image(["first line here", "an older friend", "third line"])
     canvas = np.array(image)
     # A short opening-quote mark just above the tall letters of line 2 (which start at y~496).
     cv2.line(canvas, (300, 468), (297, 482), (20, 20, 20), 4)
@@ -94,9 +93,58 @@ def test_small_mark_above_a_line_joins_that_line():
     assert y <= 468 and y + h >= 540  # line 2 now includes the mark
 
 
+def test_unclear_lines_are_left_out_with_a_warning(monkeypatch, fake_recognizer):
+    answers = iter([("Dear Ann,", 0.93), ("World Report of the House", 0.31), ('"', 0.9), ("Thank you", 0.88),
+                    ("Dripping candles, 1.000000000000000000", 0.97)])
+    monkeypatch.setattr(fake_recognizer, "read_lines", lambda crops: [next(answers) for _ in crops])
+    pdf = image_pdf([handwriting_image(["dear ann", "some words", "more words", "thank you", "candles"],
+                                       size=(1700, 1800))])
+    result = process_pdf(pdf, MODE_HANDWRITING, dpi=150, handwriting_recognizer=fake_recognizer)
+    page = result.pages[0]
+    # Removed: a guessed line, a punctuation-only line and a confident but looping line.
+    assert page.text == "Dear Ann,\nThank you"
+    assert page.warnings == ["2 lines were too unclear to read and left out; check the original."]
+
+
+def test_token_confidence_is_the_mean_probability_ignoring_padding():
+    import torch
+
+    class StubModel:
+        generation_config = type("Config", (), {"pad_token_id": 1})()
+
+        def compute_transition_scores(self, sequences, scores, normalize_logits):
+            assert normalize_logits
+            return torch.log(torch.tensor([[0.9, 0.7, 0.5], [0.4, 1.0, 1.0]]))
+
+    recognizer = HandwritingRecognizer(processor=FakeProcessor(), model=StubModel(), device="cpu")
+    output = type("Output", (), {"scores": [0, 0, 0]})()
+    sequences = torch.tensor([[2, 10, 11, 2], [2, 12, 1, 1]])  # second line is padded
+    first, second = recognizer._token_confidences(output, sequences, 2)
+    assert first == pytest.approx((0.9 + 0.7 + 0.5) / 3)
+    assert second == pytest.approx(0.4)
+
+
+def test_auto_mode_only_warns_on_a_low_confidence_scan(monkeypatch, fake_tesseract, fake_recognizer):
+    # Auto never switches to the handwriting model (tried and rejected: it misread printed
+    # receipts). A page Tesseract reads poorly keeps the Tesseract text plus a warning.
+    def fail(*_args, **_kwargs):
+        raise AssertionError("Auto mode must not run the handwriting model")
+
+    monkeypatch.setattr(fake_recognizer, "read_lines", fail)
+    fake_tesseract.confidence = 47.0
+    fake_tesseract.responder = lambda image, i: "Dcar Amn"
+    pdf = image_pdf([handwriting_image(["dear ann", "thank you"])])
+    result = process_pdf(pdf, MODE_AUTO, tesseract_cmd=fake_tesseract.cmd, handwriting_recognizer=fake_recognizer)
+    page = result.pages[0]
+    assert page.method == "Tesseract OCR" and page.text == "Dcar Amn"
+    assert "Handwriting mode" in page.warnings[0]
+
+
 def test_generation_uses_the_kv_cache(fake_recognizer):
     fake_recognizer.recognize_page(handwriting_image(["hello"]))
-    assert fake_recognizer.model.generate_options == [{"use_cache": True}]
+    (options,) = fake_recognizer.model.generate_options
+    assert options["use_cache"] is True
+    assert options["output_scores"] and options["return_dict_in_generate"]  # for line confidence
 
 
 def test_blank_page_never_calls_the_model(fake_recognizer):

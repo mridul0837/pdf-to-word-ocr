@@ -100,6 +100,27 @@ def test_join_lines_option_controls_embedded_text():
     assert "left col-\numn" in kept  # original line breaks preserved when switched off
 
 
+def test_receipt_lines_are_kept_but_wrapped_sentences_joined():
+    receipt = (
+        "CORNER CAFE\n12 MAIN STREET\nServer: Alex\nTotal $18.40\nTip $3.00\n"
+        "Please keep this copy for your\nrecords\nTable: T12"
+    )
+    assert reflow_text(receipt, set()).split("\n") == [
+        "CORNER CAFE", "12 MAIN STREET", "Server: Alex", "Total $18.40", "Tip $3.00",
+        "Please keep this copy for your records", "Table: T12",
+    ]
+
+
+def test_prose_with_long_lines_is_not_a_list():
+    from ocr_app.reflow import looks_like_a_list
+
+    prose = ["The design goals required a small, lightweight, expendable unit, suitable",
+             "for use with smaller sounding rockets and compatible with existing ground"]
+    assert not looks_like_a_list(prose)
+    assert looks_like_a_list(["Subtotal $12.87", "Tax $0.90", "Total $13.77"])
+    assert looks_like_a_list(["Item one ......... 12.50", "Another longer item name ...... 3.25", "x 10"])
+
+
 def test_tesseract_output_is_joined(fake_tesseract):
     fake_tesseract.responder = lambda image, i: "A scanned paragraph that wraps\nonto a second line.\n\nNext one.\n\x0c"
     result = process_pdf(image_pdf([text_image("x")]), MODE_PRINTED, tesseract_cmd=fake_tesseract.cmd)

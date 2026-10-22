@@ -1,5 +1,7 @@
 """Printed OCR via Tesseract (mocked), plus an optional real-Tesseract integration test."""
 
+import math
+
 import pytesseract
 import pytest
 
@@ -24,7 +26,8 @@ def test_printed_mode_ocrs_rendered_pages(fake_tesseract):
     assert result.pages[0].method == METHOD_TESSERACT
     call = fake_tesseract.calls[0]
     assert call["lang"] == "eng"
-    assert call["api"] == "txt+tsv"  # one Tesseract run returns text and confidences
+    assert call["config"] == "--psm 3"
+    assert len(fake_tesseract.calls) == 1  # a confident first reading is accepted as it is
     assert call["cmd"] == fake_tesseract.cmd
     # US Letter (8.5 x 11 in) rendered at 200 DPI.
     assert call["size"] == (1700, 2200)
@@ -106,19 +109,77 @@ def test_confident_page_has_no_hint(fake_tesseract):
     assert result.pages[0].warnings == []
 
 
-def test_mean_word_confidence_ignores_non_word_rows():
-    from conftest import TSV_HEADER
+def test_reading_rebuilds_lines_and_paragraphs_and_confidences():
+    data = {
+        "level":     [1, 5, 5, 5, 5, 5, 5],
+        "page_num":  [1, 1, 1, 1, 1, 1, 1],
+        "block_num": [0, 1, 1, 1, 1, 2, 2],
+        "par_num":   [0, 1, 1, 1, 1, 1, 1],
+        "line_num":  [0, 1, 1, 2, 2, 1, 1],
+        "word_num":  [0, 1, 2, 1, 2, 1, 2],
+        "conf":      [-1, 90.5, 40, 95, "-1", 80, 70],
+        "text":      ["", "Hello", "w0rld", "  ", "x", "Second", "block"],
+    }
+    reading = pipeline.reading_from_data(data)
+    assert reading.text == "Hello w0rld\nx\n\nSecond block"  # blank word dropped, -1 conf not counted
+    assert reading.confidences == [90.5, 40.0, 80.0, 70.0]
+    assert reading.mean_confidence == pytest.approx(70.125)
+    assert reading.quality == pytest.approx(70.125 * math.log1p(4))
+    assert pipeline.reading_from_data({}).mean_confidence is None
+    assert pipeline.reading_from_data({}).quality == 0
 
-    tsv = "\n".join([
-        TSV_HEADER,
-        "1\t1\t0\t0\t0\t0\t0\t0\t9\t9\t-1\t",        # page row
-        "5\t1\t1\t1\t1\t1\t0\t0\t9\t9\t90.5\tHello",
-        "5\t1\t1\t1\t1\t2\t0\t0\t9\t9\t40\tw0rld",
-        "5\t1\t1\t1\t1\t3\t0\t0\t9\t9\t95\t ",        # empty word
-        "5\t1\t1\t1\t1\t4\t0\t0\t9\t9\t-1\tx",        # no confidence
-    ])
-    assert pipeline.mean_word_confidence(tsv) == pytest.approx(65.25)
-    assert pipeline.mean_word_confidence(TSV_HEADER) is None
+
+def test_junk_words_are_left_out_but_still_lower_the_score():
+    data = {
+        "level":     [5, 5, 5, 5],
+        "page_num":  [1, 1, 1, 1],
+        "block_num": [1, 1, 1, 1],
+        "par_num":   [1, 1, 1, 1],
+        "line_num":  [1, 1, 1, 1],
+        "word_num":  [1, 2, 3, 4],
+        "conf":      [92, 10, 40, 88],
+        "text":      ["Total", "ine", "~|", "$13.77"],
+    }
+    reading = pipeline.reading_from_data(data)
+    assert reading.text == "Total $13.77"  # a 10%-confidence speck and a punctuation scrap removed
+    assert reading.confidences == [92, 10, 40, 88]  # ...but they still count against the reading
+
+
+def test_lines_made_of_background_noise_are_left_out():
+    data = {
+        "level":     [5, 5, 5, 5, 5, 5],
+        "page_num":  [1] * 6,
+        "block_num": [1] * 6,
+        "par_num":   [1] * 6,
+        "line_num":  [1, 1, 2, 2, 3, 3],
+        "word_num":  [1, 2, 1, 2, 1, 2],
+        "conf":      [91, 88, 41, 38, 45, 52],
+        "text":      ["Total", "$13.77", "Jj", "i=", "Tax", "$0.90"],
+    }
+    reading = pipeline.reading_from_data(data)
+    # Line 2 ("Jj i=", mean 39.5, no 3-character word) is noise; line 3 is faint but real.
+    assert reading.text == "Total $13.77\nTax $0.90"
+    assert len(reading.confidences) == 6  # noise still lowers the reading's score
+
+
+def test_unsure_reading_tries_other_readings_and_keeps_the_best(fake_tesseract):
+    # Call 1 (plain threshold) is unsure; call 2 (Sauvola) is better but still < 90;
+    # the clean-up attempts are worse. The Sauvola reading must win.
+    readings = {1: ("blurry guess", 40.0), 2: ("CORNER CAFE Total $18.40", 85.0)}
+    fake_tesseract.responder = lambda image, i: readings.get(i, ("junk", 30.0))
+    page_text, confidence = pipeline.TesseractOCR(fake_tesseract.cmd).recognize_with_confidence(text_image("receipt"))
+    assert page_text == "CORNER CAFE Total $18.40"
+    assert confidence == 85.0
+    configs = [c["config"] for c in fake_tesseract.calls]
+    assert configs[:2] == ["--psm 3", "--psm 3 -c thresholding_method=2"]
+    assert configs[-1] == "--psm 6"  # the last attempt reads the cleaned page as one block
+
+
+def test_cleanup_stops_as_soon_as_a_reading_is_confident(fake_tesseract):
+    fake_tesseract.responder = lambda image, i: ("fine text", 50.0) if i == 1 else ("great text", 95.0)
+    page_text, _ = pipeline.TesseractOCR(fake_tesseract.cmd).recognize_with_confidence(text_image("x"))
+    assert page_text == "great text"
+    assert len(fake_tesseract.calls) == 2
 
 
 def test_missing_language_data_is_a_clear_error(fake_tesseract):

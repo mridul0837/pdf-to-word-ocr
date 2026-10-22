@@ -8,6 +8,7 @@ model only produces an error when the feature that needs it is actually used.
 from __future__ import annotations
 
 import io
+import math
 import os
 import re
 import shutil
@@ -42,6 +43,15 @@ MIN_EMBEDDED_CHARS = 20
 # Mean Tesseract word confidence below this triggers a "handwritten?" hint. Measured:
 # printed pages ~96, a real handwritten letter 47.
 LOW_OCR_CONFIDENCE = 65
+# A Tesseract reading this confident is accepted without trying cleaned-up versions.
+CONFIDENT_READING = 90
+# Tesseract "words" below this confidence are almost always specks or texture, not text.
+JUNK_CONFIDENCE = 15
+# Handwritten lines whose mean token probability is below this are left out: on the
+# benchmark this removed 17 of 22 invented lines while losing 1 of ~115 real ones.
+LINE_CONFIDENCE_MIN = 0.5
+# Note: an automatic Auto -> handwriting switch was tried and rejected. On unseen printed
+# receipts it switched one, read worse than Tesseract and invented text, so Auto only warns.
 
 # Text-layer extraction flags: expand typographic ligatures ("ﬁ" -> "fi") so the Word
 # text is searchable and spell-checkable; skip image data in "dict" output.
@@ -344,34 +354,123 @@ class TesseractOCR:
 
     def recognize_with_confidence(self, image: Image.Image) -> tuple[str, Optional[float]]:
         """Return the text and the mean word confidence (0-100, None if unknown)."""
+        reading = self.read_best(image)
+        return reading.text, reading.mean_confidence
+
+    def read_best(self, image: Image.Image) -> "OcrReading":
+        """Read a page, trying cleaned-up versions when Tesseract is unsure.
+
+        A confident first reading (clean scans, digital-looking pages) is returned at once.
+        Otherwise the page is also read with adaptive (Sauvola) thresholding and, after
+        clean-up for photos (crop to the paper, colour-aware greyscale, even lighting,
+        straightened text), in two layout modes. The reading with the best confidence score
+        wins. On a benchmark of receipt photos and scans this picked a near-best reading for
+        7 of 9 documents.
+        """
+        attempts = [lambda: self.read(image, adaptive_threshold=False), lambda: self.read(image)]
+        best: Optional[OcrReading] = None
+
+        def keep(reading: OcrReading) -> bool:
+            nonlocal best
+            if best is None or reading.quality > best.quality:
+                best = reading
+            return (reading.mean_confidence or 0) >= CONFIDENT_READING
+
+        for attempt in attempts:
+            if keep(attempt()):
+                return best
+        from . import imaging
+
+        cleaned, changes = imaging.prepare_photo(image)
+        cleaned_image = Image.fromarray(cleaned)
+        if changes:  # otherwise the cleaned image is the original page
+            for adaptive in (False, True):
+                if keep(self.read(cleaned_image, adaptive_threshold=adaptive)):
+                    return best
+        keep(self.read(cleaned_image, psm=6, adaptive_threshold=False))
+        return best
+
+    def read(self, image: Image.Image, psm: Optional[int] = None, adaptive_threshold: bool = True) -> "OcrReading":
+        """One Tesseract pass returning text and per-word confidences.
+
+        ``adaptive_threshold`` selects Tesseract 5's Sauvola binarisation, which copes with
+        uneven lighting and faint print far better than its default global (Otsu) threshold:
+        on a phone-scanned thermal receipt it raised recovered key fields from 7/22 to 18/22.
+        """
         self.ensure_ready()
         pytesseract = _import_pytesseract()
         pytesseract.pytesseract.tesseract_cmd = self.cmd
+        config = f"--psm {psm or self.psm}"
+        if adaptive_threshold:
+            config += " -c thresholding_method=2"
         try:
-            if self.psm == 3:  # Tesseract's default mode: one run yields both text and TSV
-                text, tsv = pytesseract.run_and_get_multiple_output(
-                    image, extensions=["txt", "tsv"], lang=self.language
-                )
-                return text, mean_word_confidence(tsv)
-            return pytesseract.image_to_string(image, lang=self.language, config=f"--psm {self.psm}"), None
+            data = pytesseract.image_to_data(
+                image, lang=self.language, config=config, output_type=pytesseract.Output.DICT
+            )
         except pytesseract.TesseractNotFoundError as exc:
             raise TesseractNotFoundError(f"Tesseract at {self.cmd} could not be run.") from exc
         except pytesseract.TesseractError as exc:
             raise OCRError(f"Tesseract failed: {exc.message or exc}") from exc
+        return reading_from_data(data)
 
 
-def mean_word_confidence(tsv: str) -> Optional[float]:
-    """Average confidence of the recognised words in Tesseract TSV output."""
-    confidences = []
-    for row in tsv.splitlines()[1:]:
-        cols = row.split("\t")
-        if len(cols) == 12 and cols[0] == "5" and cols[11].strip():
-            try:
-                confidences.append(float(cols[10]))
-            except ValueError:
-                continue
-    confidences = [c for c in confidences if c >= 0]
-    return sum(confidences) / len(confidences) if confidences else None
+@dataclass
+class OcrReading:
+    """One Tesseract pass: the text and the confidence (0-100) of each recognised word."""
+
+    text: str
+    confidences: list[float]
+
+    @property
+    def mean_confidence(self) -> Optional[float]:
+        return sum(self.confidences) / len(self.confidences) if self.confidences else None
+
+    @property
+    def quality(self) -> float:
+        """Score for choosing between readings of the same page: mean confidence, mildly
+        rewarding more recognised words (so 4 sure words don't beat 100 fairly sure ones).
+        Chosen over alternatives because it best tracked accuracy on the benchmark."""
+        return (self.mean_confidence or 0.0) * math.log1p(len(self.confidences))
+
+
+def reading_from_data(data: dict) -> OcrReading:
+    """Rebuild Tesseract's text layout from ``image_to_data`` output: one line per text line
+    and a blank line between paragraphs, as its plain-text output has."""
+    paragraphs: dict[tuple, dict[int, list[tuple[str, float]]]] = {}
+    confidences: list[float] = []
+    for i, level in enumerate(data.get("level", [])):
+        word = str(data["text"][i]).strip()
+        if int(level) != 5 or not word:
+            continue
+        try:
+            confidence = float(data["conf"][i])
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if confidence >= 0:
+            confidences.append(confidence)  # junk still counts: it marks a poor reading
+        if 0 <= confidence < JUNK_CONFIDENCE or (0 <= confidence < 50 and not any(c.isalnum() for c in word)):
+            continue  # specks, folds and table texture read as "words": left out of the text
+        paragraph = (data["page_num"][i], data["block_num"][i], data["par_num"][i])
+        paragraphs.setdefault(paragraph, {}).setdefault(int(data["line_num"][i]), []).append((word, confidence))
+    blocks = []
+    for lines in paragraphs.values():
+        kept = [" ".join(w for w, _c in words) for words in lines.values() if not _junk_line(words)]
+        if kept:
+            blocks.append("\n".join(kept))
+    return OcrReading("\n\n".join(blocks), confidences)
+
+
+_REAL_WORD = re.compile(r"[A-Za-z0-9]{3,}")
+
+
+def _junk_line(words: list[tuple[str, float]]) -> bool:
+    """A line Tesseract made out of a photo's background or folds: very low confidence, or
+    low confidence with no real word (3+ letters or digits) in it."""
+    scored = [c for _w, c in words if c >= 0]
+    if not scored:
+        return False
+    mean = sum(scored) / len(scored)
+    return mean < 30 or (mean < 50 and not any(_REAL_WORD.search(w) for w, _c in words))
 
 
 # --------------------------------------------------------------------------- handwriting
@@ -381,26 +480,24 @@ Box = tuple[int, int, int, int]  # x, y, width, height
 
 
 def segment_lines(image: Image.Image) -> list[Box]:
-    """Find text lines on a page with a simple OpenCV heuristic, top to bottom.
+    """Find handwritten text lines on a page, top to bottom.
 
-    Returns an empty list for blank / near-uniform pages so that the
-    handwriting model is never asked to read an empty crop (TrOCR tends to
-    hallucinate text for those).
+    Ink is found with a local (adaptive) threshold, which works on photos with uneven light
+    and grey or coloured paper, where one global threshold mistakes shading for ink. Ruled
+    lines and form boxes are removed and specks ignored. Returns an empty list for blank
+    pages, so the handwriting model is never asked to read an empty crop (TrOCR invents
+    text for those).
     """
     import cv2
     import numpy as np
 
+    from . import imaging
+
     gray = np.asarray(image.convert("L"))
     if gray.size == 0:
         return []
-    gray = cv2.medianBlur(gray, 3)
-    threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    ink = binary > 0
-    min_ink_pixels = max(50, int(gray.size * 0.00005))
-    if int(ink.sum()) < min_ink_pixels or ink.all():
-        return []
-    contrast = float(gray[~ink].mean()) - float(gray[ink].mean())
-    if contrast < 40:
+    binary = imaging.remove_specks(imaging.remove_frames(imaging.remove_rules(imaging.ink_mask(gray))))
+    if int(np.count_nonzero(binary)) < max(50, int(gray.size * 0.00005)):
         return []
 
     img_h, img_w = binary.shape
@@ -415,16 +512,98 @@ def segment_lines(image: Image.Image) -> list[Box]:
 
     lines: list[list[int]] = []
     for x, y, w, h in boxes:
-        if lines:
-            lx, ly, lw, lh = lines[-1]
+        target = None
+        for index in range(len(lines) - 1, max(-1, len(lines) - 4), -1):  # the last few lines
+            lx, ly, lw, lh = lines[index]
             overlap = min(y + h, ly + lh) - max(y, ly)
-            if overlap >= 0.5 * min(h, lh):
-                nx, ny = min(lx, x), min(ly, y)
-                lines[-1] = [nx, ny, max(lx + lw, x + w) - nx, max(ly + lh, y + h) - ny]
-                continue
-        lines.append([x, y, w, h])
+            side_by_side = x >= lx + lw or x + w <= lx
+            # Stacked boxes need half their height in common; word groups side by side on a
+            # slanted line need less, because each sits a little higher than the last.
+            if overlap >= (0.3 if side_by_side else 0.5) * min(h, lh):
+                target = index
+                break
+        if target is None:
+            lines.append([x, y, w, h])
+        else:
+            lx, ly, lw, lh = lines[target]
+            nx, ny = min(lx, x), min(ly, y)
+            lines[target] = [nx, ny, max(lx + lw, x + w) - nx, max(ly + lh, y + h) - ny]
+    lines = _merge_overlapping(_split_tall_lines(binary, lines))
     lines.sort(key=lambda b: b[1])
     return [tuple(b) for b in _merge_small_marks(lines)]
+
+
+def _merge_overlapping(lines: list[list[int]]) -> list[list[int]]:
+    """Boxes that overlap horizontally and share most of their height are the same line:
+    merge them, so no line is cropped (and read) twice."""
+    lines = [list(b) for b in lines]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(lines)):
+            for j in range(i + 1, len(lines)):
+                (ax, ay, aw, ah), (bx, by, bw, bh) = lines[i], lines[j]
+                v_overlap = min(ay + ah, by + bh) - max(ay, by)
+                h_overlap = min(ax + aw, bx + bw) - max(ax, bx)
+                if h_overlap > 0 and v_overlap > 0.5 * min(ah, bh):
+                    nx, ny = min(ax, bx), min(ay, by)
+                    lines[i] = [nx, ny, max(ax + aw, bx + bw) - nx, max(ay + ah, by + bh) - ny]
+                    del lines[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return lines
+
+
+def _line_height(binary) -> float:
+    """Typical text-line height, from the size of the written shapes (letters / words)."""
+    import cv2
+    import numpy as np
+
+    _count, _labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    heights = stats[1:, cv2.CC_STAT_HEIGHT]
+    page_h = binary.shape[0]
+    heights = heights[(heights >= max(6, page_h * 0.004)) & (heights <= page_h * 0.15)]
+    return 1.5 * float(np.median(heights)) if heights.size else 0.0
+
+
+def _split_tall_lines(binary, lines: list[list[int]]) -> list[list[int]]:
+    """Split boxes that hold several text lines (descenders touching the next line, drawings
+    bridging lines) at the emptiest rows near the expected line breaks."""
+    import numpy as np
+
+    pitch = _line_height(binary)
+    if pitch <= 0:
+        return lines
+    result: list[list[int]] = []
+    for x, y, w, h in lines:
+        count = int(round(h / pitch))
+        if h <= 1.7 * pitch or count < 2:
+            result.append([x, y, w, h])
+            continue
+        region = binary[y:y + h, x:x + w] > 0
+        profile = region.sum(axis=1).astype(float)
+        k = max(3, int(pitch * 0.25)) | 1
+        smooth = np.convolve(profile, np.ones(k) / k, mode="same")
+        dense = float(np.percentile(smooth, 90))
+        reach = int(0.4 * pitch)
+        cuts = [0]
+        for i in range(1, count):
+            centre = int(i * h / count)
+            lo, hi = max(cuts[-1] + 1, centre - reach), min(h - 1, centre + reach)
+            if hi > lo:
+                cut = lo + int(np.argmin(smooth[lo:hi]))
+                if smooth[cut] <= 0.25 * dense:  # only at a real gap between lines
+                    cuts.append(cut)
+        cuts.append(h)
+        for top, bottom in zip(cuts, cuts[1:]):
+            rows = np.flatnonzero(region[top:bottom].any(axis=1))
+            cols = np.flatnonzero(region[top:bottom].any(axis=0))
+            if rows.size and cols.size:
+                result.append([x + int(cols[0]), y + top + int(rows[0]),
+                               int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)])
+    return result
 
 
 def _merge_small_marks(lines: list[list[int]]) -> list[list[int]]:
@@ -462,6 +641,8 @@ def crop_line(image: Image.Image, box: Box) -> Image.Image:
     ).convert("RGB")
 
 
+# Eight or more identical characters in a row ("00000000", "........"): a looping model.
+_REPEATED_RUN = re.compile(r"(.)\1{7,}")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:!?)\]])")
 _SPACE_AFTER_BRACKET_RE = re.compile(r"([(\[])\s+")
 _QUOTED_RE = re.compile(r'"\s*([^"]*?)\s*"')
@@ -527,6 +708,10 @@ class HandwritingRecognizer:
         self.device: Optional[str] = None
         self.batch_size = max(1, batch_size)
         self.max_new_tokens = max_new_tokens
+        # Beam search (3) vs greedy on 7 handwritten pages: mean CER 0.175 -> 0.165 (a neat
+        # letter 1.6% -> 1.0%) for about 40% more time.
+        self.num_beams = 3
+        self.last_page_unclear = 0  # lines left out of the last page as too unclear
         self._lock = threading.Lock()
 
     @property
@@ -593,26 +778,59 @@ class HandwritingRecognizer:
 
     def recognize_lines(self, crops: Sequence[Image.Image]) -> list[str]:
         """Recognise a batch of single-line images; returns one string per crop."""
+        return [text for text, _confidence in self.read_lines(crops)]
+
+    def read_lines(self, crops: Sequence[Image.Image]) -> list[tuple[str, Optional[float]]]:
+        """Recognise single-line images: (text, confidence) per crop.
+
+        The confidence is the mean probability the model gave its own output tokens
+        (None if the model does not report scores). Very low values mean it is guessing,
+        for example on a crop with no writing, where TrOCR tends to invent fluent text.
+        """
         if not crops:
             return []
         import torch
 
         self.load()
         pixel_values = self.processor(images=list(crops), return_tensors="pt").pixel_values
+        # Room for the text a crop of this shape can hold: stops runaway output on short crops.
+        widest = max(crop.width / max(1, crop.height) for crop in crops)
         # The checkpoint's generation config disables the KV cache; enabling it gives
         # identical text about 2.4x faster (measured on a 26-line page on CPU).
-        options = {"max_new_tokens": self.max_new_tokens, "use_cache": True}
+        # no_repeat_ngram_size stops degenerate loops ("0 0 0 0 …"), which the model emits with
+        # high confidence, so the confidence filter alone does not catch them.
+        options = {"max_new_tokens": min(self.max_new_tokens, int(16 + 8 * widest)), "use_cache": True,
+                   "output_scores": True, "return_dict_in_generate": True, "no_repeat_ngram_size": 3}
+        if self.num_beams > 1:
+            options["num_beams"] = self.num_beams
         try:
             with torch.inference_mode():
-                ids = self.model.generate(pixel_values.to(self.device), **options)
+                output = self.model.generate(pixel_values.to(self.device), **options)
         except RuntimeError as exc:
             if self.device == "cpu" or "out of memory" not in str(exc).lower():
                 raise
             torch.cuda.empty_cache()
             self._place_model("cpu")
             with torch.inference_mode():
-                ids = self.model.generate(pixel_values.to("cpu"), **options)
-        return [tidy_trocr_text(t) for t in self.processor.batch_decode(ids, skip_special_tokens=True)]
+                output = self.model.generate(pixel_values.to("cpu"), **options)
+        sequences = getattr(output, "sequences", output)
+        texts = [tidy_trocr_text(t) for t in self.processor.batch_decode(sequences, skip_special_tokens=True)]
+        return list(zip(texts, self._token_confidences(output, sequences, len(texts))))
+
+    def _token_confidences(self, output, sequences, count: int) -> list[Optional[float]]:
+        scores = getattr(output, "scores", None)
+        if not scores or not hasattr(self.model, "compute_transition_scores"):
+            return [None] * count
+        beams = getattr(output, "beam_indices", None)
+        if beams is not None:
+            log_probs = self.model.compute_transition_scores(sequences, scores, beams, normalize_logits=False)
+        else:
+            log_probs = self.model.compute_transition_scores(sequences, scores, normalize_logits=True)
+        generated = sequences[:, -log_probs.shape[1]:]
+        pad = getattr(getattr(self.model, "generation_config", None), "pad_token_id", None)
+        mask = (generated != pad) if pad is not None else (generated == generated)
+        probs = log_probs.exp() * mask
+        return [float(p.sum() / max(1, int(m.sum()))) for p, m in zip(probs, mask)]
 
     def recognize_page(
         self,
@@ -621,19 +839,31 @@ class HandwritingRecognizer:
         cancel_check: Optional[CancelCheck] = None,
     ) -> str:
         status = status_callback or (lambda _msg: None)
-        boxes = segment_lines(image)
+        from . import imaging
+
+        # Photos: crop to the paper, even out the light, straighten. Clean scans pass unchanged.
+        cleaned, _changes = imaging.prepare_photo(image)
+        page = Image.fromarray(cleaned).convert("RGB")
+        boxes = segment_lines(page)
+        self.last_page_unclear = 0
         if not boxes:
             return ""
         self.load(status)
-        crops = [crop_line(image, box) for box in boxes]
+        crops = [crop_line(page, box) for box in boxes]
         lines: list[str] = []
         for start in range(0, len(crops), self.batch_size):
             if cancel_check and cancel_check():
                 raise ProcessingCancelled()
             end = min(start + self.batch_size, len(crops))
             status(f"Recognizing handwritten lines {start + 1}–{end} of {len(crops)} ({self.device})…")
-            lines.extend(self.recognize_lines(crops[start:end]))
-        return "\n".join(line for line in lines if line)
+            for text, confidence in self.read_lines(crops[start:end]):
+                if not any(ch.isalnum() for ch in text):
+                    continue
+                if (confidence is not None and confidence < LINE_CONFIDENCE_MIN) or _REPEATED_RUN.search(text):
+                    self.last_page_unclear += 1  # the model is guessing or looping
+                    continue
+                lines.append(text)
+        return "\n".join(lines)
 
 
 _recognizers: dict[str, HandwritingRecognizer] = {}
@@ -720,7 +950,7 @@ def process_pdf(
                     text = recognizer.recognize_page(
                         image, lambda m: status(f"{prefix}: {m}"), cancel_check
                     )
-                    result = PageResult(number, clean_text(text), METHOD_TROCR)
+                    result = PageResult(number, clean_text(text), METHOD_TROCR, _unclear_warning(recognizer))
                 elif mode == MODE_PRINTED:
                     status(f"{prefix}: running Tesseract OCR…")
                     text, confidence = printed.recognize_with_confidence(render_page(page, dpi))
@@ -766,6 +996,13 @@ class _Paragraphs:
         return clean_text(reflow_text(text, self.vocabulary))
 
 
+def _unclear_warning(recognizer) -> list[str]:
+    unclear = getattr(recognizer, "last_page_unclear", 0)
+    if not unclear:
+        return []
+    return [f"{unclear} line{'s were' if unclear > 1 else ' was'} too unclear to read and left out; check the original."]
+
+
 def _process_auto_page(page, number, dpi, printed: TesseractOCR, status, prefix, paragraphs: _Paragraphs) -> PageResult:
     embedded = clean_text(page.get_text("text", flags=TEXT_FLAGS))
     has_images = bool(page.get_images(full=False))
@@ -774,7 +1011,8 @@ def _process_auto_page(page, number, dpi, printed: TesseractOCR, status, prefix,
 
     status(f"{prefix}: no usable embedded text, running Tesseract OCR…")
     try:
-        ocr_text, confidence = printed.recognize_with_confidence(render_page(page, dpi))
+        image = render_page(page, dpi)
+        ocr_text, confidence = printed.recognize_with_confidence(image)
         ocr_text = paragraphs.ocr(ocr_text)
     except (TesseractNotFoundError, TesseractLanguageError) as exc:
         first_line = str(exc).splitlines()[0]

@@ -74,7 +74,23 @@ def image_pdf(images: list[Image.Image | None], page_size=(612, 792)) -> bytes:
 # --------------------------------------------------------------------------- Tesseract
 
 
-TSV_HEADER = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+def tesseract_data(text: str, confidence: float) -> dict:
+    """``image_to_data`` DICT output for ``text``: blank lines separate paragraphs."""
+    keys = ("level", "page_num", "block_num", "par_num", "line_num", "word_num", "conf", "text")
+    data = {k: [] for k in keys}
+
+    def row(level, par, line, word, conf, value):
+        for k, v in zip(keys, (level, 1, 1, par, line, word, conf, value)):
+            data[k].append(v)
+
+    row(1, 0, 0, 0, -1, "")  # page row
+    paragraphs = [p for p in text.replace("\x0c", "").split("\n\n") if p.strip()]
+    for par, paragraph in enumerate(paragraphs, 1):
+        row(3, par, 0, 0, -1, "")
+        for line_num, line in enumerate(paragraph.splitlines(), 1):
+            for word_num, word in enumerate(line.split(), 1):
+                row(5, par, line_num, word_num, confidence, word)
+    return data
 
 
 class FakeTesseract:
@@ -85,19 +101,12 @@ class FakeTesseract:
         self.confidence = 95.0  # reported for every word
         self.responder = lambda image, call_index: f"Recognized printed text {call_index}"
 
-    def _run(self, image, lang, api):
-        self.calls.append({"size": image.size, "lang": lang, "api": api, "cmd": pytesseract.pytesseract.tesseract_cmd})
-        return self.responder(image, len(self.calls))
-
-    def image_to_string(self, image, lang=None, config=""):
-        return self._run(image, lang, f"image_to_string {config}")
-
-    def run_and_get_multiple_output(self, image, extensions, lang=None, **_kwargs):
-        assert extensions == ["txt", "tsv"]
-        text = self._run(image, lang, "txt+tsv")
-        rows = [TSV_HEADER, "1\t1\t0\t0\t0\t0\t0\t0\t100\t100\t-1\t"]
-        rows += [f"5\t1\t1\t1\t1\t{i}\t0\t0\t10\t10\t{self.confidence}\t{w}" for i, w in enumerate(text.split(), 1)]
-        return [text, "\n".join(rows)]
+    def image_to_data(self, image, lang=None, config="", output_type=None, **_kwargs):
+        """The responder returns the text, or (text, confidence) to vary confidence per call."""
+        self.calls.append({"size": image.size, "lang": lang, "config": config, "cmd": pytesseract.pytesseract.tesseract_cmd})
+        answer = self.responder(image, len(self.calls))
+        text, confidence = answer if isinstance(answer, tuple) else (answer, self.confidence)
+        return tesseract_data(text, confidence)
 
 
 @pytest.fixture
@@ -108,8 +117,7 @@ def fake_tesseract(monkeypatch, tmp_path):
     exe.write_bytes(b"")
     fake = FakeTesseract(str(exe))
     monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
-    monkeypatch.setattr(pytesseract, "image_to_string", fake.image_to_string)
-    monkeypatch.setattr(pytesseract, "run_and_get_multiple_output", fake.run_and_get_multiple_output)
+    monkeypatch.setattr(pytesseract, "image_to_data", fake.image_to_data)
     monkeypatch.setattr(pytesseract, "get_languages", lambda config="": list(fake.languages))
     return fake
 
@@ -185,6 +193,22 @@ def fake_recognizer():
 @pytest.fixture(autouse=True)
 def _isolate_recognizer_cache(monkeypatch):
     monkeypatch.setattr(pipeline, "_recognizers", {})
+
+
+@pytest.fixture(autouse=True)
+def _no_real_handwriting_model(request, monkeypatch):
+    """Unit tests must not depend on the TrOCR weights being on this computer: loading the
+    real model fails as it would on a machine without it (``fake_transformers`` and the
+    integration tests override this)."""
+    if request.node.get_closest_marker("integration"):
+        return
+    import transformers
+
+    def unavailable(source, **_kwargs):
+        raise OSError(f"{source}: model weights are not used in unit tests")
+
+    monkeypatch.setattr(transformers.TrOCRProcessor, "from_pretrained", unavailable)
+    monkeypatch.setattr(transformers.VisionEncoderDecoderModel, "from_pretrained", unavailable)
 
 
 @pytest.fixture(autouse=True)

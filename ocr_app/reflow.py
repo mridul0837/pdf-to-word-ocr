@@ -82,13 +82,46 @@ def join_paragraph(lines: list[str], vocabulary: set[str]) -> str:
     return text
 
 
+_ENDS_WITH_NUMBER = re.compile(r"[\d%)]$")
+
+
+def looks_like_a_list(lines: list[str]) -> bool:
+    """Receipts, addresses, tables and lists: short lines, or many ending in an amount.
+    Their line breaks carry meaning, so they are kept rather than joined."""
+    if len(lines) < 2:
+        return False
+    lengths = sorted(len(line) for line in lines)
+    median = lengths[len(lengths) // 2]
+    numeric_ends = sum(1 for line in lines if _ENDS_WITH_NUMBER.search(line)) / len(lines)
+    return median < 32 or numeric_ends >= 0.3
+
+
+_WRAP_END = re.compile(r"[a-z,-]$")
+
+
+def _join_wrapped_sentences(lines: list[str], vocabulary: set[str]) -> list[str]:
+    """In a list-like block keep the lines, except where a sentence clearly wraps: the line
+    ends in a lower-case word or comma and the next line starts in lower case."""
+    kept: list[str] = []
+    for line in lines:
+        if kept and _WRAP_END.search(kept[-1]) and line[:1].islower():
+            kept[-1] = join_lines(kept[-1], line, vocabulary)
+        else:
+            kept.append(line)
+    return kept
+
+
 def reflow_text(text: str, vocabulary: set[str]) -> str:
     """Reflow plain text (e.g. Tesseract output): blank lines separate paragraphs; inside a
-    block, a line ends its paragraph when it is very short, or short and ends a sentence."""
+    block, a line ends its paragraph when it is very short, or short and ends a sentence.
+    List-like blocks (see ``looks_like_a_list``) keep their lines."""
     paragraphs: list[str] = []
     for chunk in re.split(r"\n\s*\n", text):
         lines = [line.strip() for line in chunk.splitlines() if line.strip()]
         if not lines:
+            continue
+        if looks_like_a_list(lines):
+            paragraphs.append("\n".join(_join_wrapped_sentences(lines, vocabulary)))
             continue
         longest = max(len(line) for line in lines)
         current: list[str] = []

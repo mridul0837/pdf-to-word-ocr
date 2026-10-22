@@ -98,43 +98,15 @@ if (Test-Path -LiteralPath $modelTarget) { Remove-Item -LiteralPath $modelTarget
 New-Item -ItemType Directory -Force -Path $modelTarget | Out-Null
 Copy-Item -Path (Join-Path $ModelDir "*") -Destination $modelTarget -Recurse
 
-# ---------------------------------------------------------------- instructions for the user
-$howTo = @"
-PDF to Word OCR
-===============
-
-Turns PDFs and images (PNG, JPG, TIFF...) - typed, scanned or handwritten - into
-editable Word documents. Everything runs on this computer. No installation and no
-internet connection needed.
-
-START
-  Double-click PDFtoWordOCR.exe.
-  Keep it inside this folder (it needs the files next to it).
-  For a desktop icon: right-click PDFtoWordOCR.exe > Send to > Desktop (create shortcut).
-  If Windows says "Windows protected your PC": click "More info", then "Run anyway".
-
-USE
-  1. Click "Choose file..." (or drag a PDF or image onto the window).
-  2. Pick a Mode:
-       Auto          - normal PDFs and scanned printed pages (start with this)
-       Printed Text  - scanned typed or printed documents
-       Handwriting   - HANDWRITTEN pages (English; slower, about 20-40 seconds per page)
-     Auto and Printed Text cannot read handwriting. If you get gibberish or a
-     "Low OCR confidence" warning, run it again in Handwriting mode.
-  3. Click "Extract text" and wait for "Finished".
-  4. Check the text in the big box and fix any mistakes.
-     Lines like "===== PAGE 2 ... =====" become page breaks in Word.
-  5. Click "Save Word document". The file is saved next to your original file
-     (the path is shown in "Save Word file as").
-
-TIPS
-  - "Join lines into paragraphs" (on by default) rebuilds normal paragraphs. Untick it
-    if the original line breaks matter (poems, addresses, lists).
-  - Clear, straight scans at 250-300 DPI give the best results.
-  - Always proofread names, numbers and dates.
-  - Included OCR language: English.
-"@
-Set-Content -LiteralPath (Join-Path $dist "HOW TO USE.txt") -Value $howTo -Encoding UTF8
+# ---------------------------------------------------------------- user manual
+# docs\USER_MANUAL.txt / .md are written for the person receiving the app.
+$manualDir = Join-Path $PSScriptRoot "docs"
+foreach ($ext in "txt", "md") {
+    $manual = Join-Path $manualDir "USER_MANUAL.$ext"
+    if (-not (Test-Path -LiteralPath $manual)) { throw "$manual is missing." }
+    Copy-Item -LiteralPath $manual -Destination (Join-Path $dist "User Manual.$ext")
+}
+Remove-Item -LiteralPath (Join-Path $dist "HOW TO USE.txt") -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------- self-test with this PC's installs hidden
 Write-Host "== Self-test (local Tesseract install, model cache and network hidden)"
@@ -178,4 +150,10 @@ if (-not $NoZip) {
     & (Join-Path $env:SystemRoot "System32\tar.exe") -a -c -f $ZipPath -C (Split-Path $dist) (Split-Path $dist -Leaf)
     if ($LASTEXITCODE -ne 0) { throw "Creating the ZIP failed." }
     Write-Host ("ZIP ready: {0} ({1:N2} GB)" -f $ZipPath, ((Get-Item -LiteralPath $ZipPath).Length / 1GB))
+    # Copies beside the ZIP, so the recipient can read them before downloading.
+    foreach ($ext in "txt", "md") {
+        $copy = Join-Path (Split-Path $ZipPath) "PDFtoWordOCR - User Manual.$ext"
+        Copy-Item -LiteralPath (Join-Path $manualDir "USER_MANUAL.$ext") -Destination $copy
+        Write-Host "Manual beside the ZIP: $copy"
+    }
 }

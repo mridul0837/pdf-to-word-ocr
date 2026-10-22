@@ -61,7 +61,11 @@ def test_blank_page_in_auto_mode_yields_warning_not_failure(fake_tesseract):
     assert blank.text == ""
     assert blank.warnings == ["No text recognized (blank page?)."]
     assert result.warnings == ["Page 2: No text recognized (blank page?)."]
-    assert len(fake_tesseract.calls) == 1  # only the blank page needed OCR
+    # Only the blank page needed OCR. Finding nothing, it was also tried with adaptive
+    # thresholding and as a single block; clean-up changes nothing on a white page.
+    assert [c["config"] for c in fake_tesseract.calls] == [
+        "--psm 3", "--psm 3 -c thresholding_method=2", "--psm 6",
+    ]
 
 
 def test_status_messages_are_reported(ocr_must_not_run):

@@ -26,6 +26,11 @@ you would rather keep to yourself, such as contracts, medical letters, IDs and n
 | **Handwriting** | Handwritten pages (English) | [TrOCR](https://huggingface.co/microsoft/trocr-base-handwritten), line by line |
 
 - Opens PDFs and images (PNG, JPG, TIFF, BMP, GIF, WEBP).
+- Cleans up phone photos and scans before OCR: crops to the paper, evens out shadows,
+  picks the colour channel with the most contrast and straightens tilted pages. Pages that
+  read poorly are tried several ways and the most confident reading wins.
+- Handwriting mode leaves out lines the model can't read reliably, and says how many,
+  instead of inventing text.
 - Shows the recognized text for review and editing before saving it as `.docx`.
 - Turns printed line breaks back into paragraphs and rejoins words split by a hyphen, so
   the Word text reflows when edited. Untick *Join lines into paragraphs* to keep the
@@ -37,14 +42,26 @@ you would rather keep to yourself, such as contracts, medical letters, IDs and n
 
 ## Results
 
-Measured on single documents (not a benchmark):
+Measured on a private test set of hard real-world documents: receipt photos (CORD, SROIE,
+Wikimedia Commons and a CamScanner taxi receipt), handwritten letters, notes and forms
+(GNHK, and one scanned letter), and research papers including a two-column IEEE paper.
+"Words found" is the F1 score of the recognized words against a hand-checked
+transcription (1.0 = every word right, nothing extra).
 
-| Document | Mode | Result |
-|---|---|---|
-| Handwritten letter, 26 lines, ~130 DPI scan | Handwriting | 1.0% characters wrong, 4.4% words wrong, ~20 s on an 8-core CPU |
-| Same letter | Auto (Tesseract) | 96% words wrong, plus a "use Handwriting mode" warning |
-| 12-page two-column research paper (digital PDF) | Auto | Exact text in under 1 s; 1,478 line fragments become 266 paragraphs |
-| Same paper, pages as images | Printed Text | About 1% words wrong on plain text pages |
+| Documents | Mode | Words found, original → now | Characters wrong, original → now |
+|---|---|---|---|
+| 7 receipt photos and scans | Auto | 0.56 → **0.67** | 42% → **26%** |
+| 7 handwritten pages | Handwriting | 0.39 → **0.81** | 62% → **17%** |
+| 4 unseen receipts* | Auto | 0.42 → **0.58** | 53% → 45% |
+| 5 unseen handwritten pages* | Handwriting | 0.21 → **0.50** | 81% → **57%** |
+| 6 research papers, digital and scanned | Auto | 0.98 → 0.98 | 2.6% of words wrong; column order kept |
+
+\* Never used while tuning, to check that the gains carry over to new documents.
+
+Examples: the taxi receipt went from 7 to 18 of 22 key fields (amounts, dates, IDs); a
+neat 26-line handwritten letter has 1% of characters wrong, in about 35 s on an 8-core CPU; a
+scanned two-column IEEE paper read in the right column order has 4% of words wrong.
+The test set is not published because of its licences and private documents.
 
 ## Download and run
 
@@ -84,7 +101,7 @@ winget install --id UB-Mannheim.TesseractOCR      # printed-text OCR engine
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-The suite runs offline in about 10 seconds. External engines and the GUI's dialogs are
+The suite runs offline in about 25 seconds. External engines and the GUI's dialogs are
 mocked. Tests marked `integration` use the real Tesseract, and the real TrOCR model when
 `PDFOCR_RUN_MODEL_TESTS=1` is set. They skip themselves when those are unavailable.
 
@@ -95,7 +112,8 @@ mocked. Tests marked `integration` use the real Tesseract, and the real TrOCR mo
 .\make_portable.ps1   # bundles Tesseract + model, re-tests with local installs hidden -> dist\PDFtoWordOCR-portable.zip
 ```
 
-`make_portable.ps1` needs Tesseract installed on the build PC. On any PC,
+`make_portable.ps1` needs Tesseract installed on the build PC. It also puts the
+plain-language [user manual](docs/USER_MANUAL.md) in the ZIP and beside it. On any PC,
 `PDFtoWordOCR.exe --self-test report.json` reports which features work there.
 
 ## Project layout
@@ -103,11 +121,13 @@ mocked. Tests marked `integration` use the real Tesseract, and the real TrOCR mo
 ```
 desktop_app.py          PySide6 window and entry point
 ocr_app/pipeline.py     File loading, Tesseract, line segmentation, TrOCR, orchestration
+ocr_app/imaging.py      Photo clean-up: paper crop, lighting, ink mask, rules/frames, deskew
 ocr_app/reflow.py       Rebuilds paragraphs and repairs hyphenated words
 ocr_app/docx_export.py  Edited text -> .docx (page markers -> page breaks)
 ocr_app/fetch_model.py  Downloads or exports the handwriting model
 ocr_app/selftest.py     Headless checks for a built app
 tests/                  pytest suite
+docs/USER_MANUAL.*      Plain-language manual for end users (.md and .txt)
 build_exe.ps1, make_portable.ps1, PDFtoWordOCR.spec   Packaging
 ```
 
@@ -117,6 +137,10 @@ build_exe.ps1, make_portable.ps1, PDFtoWordOCR.spec   Packaging
   reproduced, and text inside figures becomes separate short paragraphs.
 - Handwriting recognition is English-only and works best on clearly separated horizontal
   lines. Always proofread names, numbers and dates.
+- Crumpled or folded receipt photos still read poorly. Dot-matrix printing with slashed
+  zeros is often misread (0 as 6 or 8), and similar characters in IDs (0/O, 1/l) get confused.
+- The handwriting model is trained on handwriting: on printed text, forms or pictures it can
+  produce confident-looking text that isn't there. Use it only for handwritten pages.
 - Windows only; tested on Windows 10 with Python 3.13.
 
 ## Third-party components
